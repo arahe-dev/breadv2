@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cmd /c build_kernels.bat)",
+      "Bash(./bread_info.exe \"C:\\\\Users\\\\arahe\\\\.ollama\\\\models\\\\blobs\\\\sha256-900dde62fb7ebe8a5a25e35d5b7633f403f226a310965fed51d50f5238ba145a\")",
+      "Bash(gh pr:*)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/ggml/src/ggml-cuda/gated_delta_net.cu\" -o /c/bread_v2/ref_gated_delta_net.cu)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/ggml/src/ggml-cuda/gated_delta_net.cuh\" -o /c/bread_v2/ref_gated_delta_net.cuh)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/ggml/src/ggml-cpu/ops.cpp\" -o /c/bread_v2/ref_ops.cpp)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/src/models/qwen35moe.cpp\" -o /c/bread_v2/ref_qwen35moe.cpp)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/src/models/delta-net-base.cpp\" -o /c/bread_v2/ref_delta_net_base.cpp)",
+      "Bash(curl -sL https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/src/models/qwen35moe.cpp)"
+    ]
+  }
+}
