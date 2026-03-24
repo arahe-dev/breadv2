@@ -1,6 +1,8 @@
 #ifndef BREAD_H
 #define BREAD_H
 
+#include "gguf.h"
+
 /* bread.h — model constants for Qwen3.5-35B-A3B (GGUF verified)
  *
  * All values derived directly from GGUF metadata (config_reader.exe)
@@ -31,10 +33,12 @@
 #define BREAD_NUM_KV_HEADS    2        /* KV heads for full-attention layers   */
 #define BREAD_HEAD_DIM_QK     256      /* key/query head dim (key_length)      */
 #define BREAD_HEAD_DIM_V      256      /* value head dim  (value_length)       */
+#define BREAD_HEAD_DIM_QGATE  256      /* per-head sigmoid gate dim            */
 #define BREAD_Q_PROJ_DIM      8192     /* Q projection output: 16 × 512        */
 #define BREAD_KV_PROJ_DIM     512      /* K or V projection output: 2 × 256    */
 #define BREAD_ATTN_OUT_DIM    4096     /* o_proj input: 16 × 256               */
 #define BREAD_HEAD_DIM_ROPE   128      /* rotary dims per head (partial RoPE)  */
+#define BREAD_KV_CACHE_LEN    8192     /* host KV cache capacity per FA layer  */
 
 /* True for full-attention layers, false for SSM/GatedDeltaNet        */
 #define BREAD_IS_FULL_ATTN(layer)  (((layer) % 4) == 3)
@@ -73,5 +77,48 @@
 #define BREAD_MODEL_PATH \
     "C:\\Users\\arahe\\.ollama\\models\\blobs\\" \
     "sha256-900dde62fb7ebe8a5a25e35d5b7633f403f226a310965fed51d50f5238ba145a"
+
+typedef struct {
+    int hidden_dim;
+    int num_layers;
+    int vocab_size;
+
+    int num_q_heads;
+    int num_kv_heads;
+    int head_dim_qk;
+    int head_dim_v;
+    int head_dim_qgate;
+    int q_proj_dim;
+    int kv_proj_dim;
+    int attn_out_dim;
+    int head_dim_rope;
+    int kv_cache_len;
+
+    int ssm_num_k_heads;
+    int ssm_num_v_heads;
+    int ssm_head_dim;
+    int ssm_qkv_dim;
+    int ssm_z_dim;
+    int ssm_conv_kernel;
+
+    int expert_inter;
+    int shared_inter;
+    int num_experts;
+    int top_k;
+
+    float rms_eps;
+    float rope_freq_base;
+} bread_model_config_t;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int bread_model_config_init(const char *model_path, const gguf_ctx_t *g);
+const bread_model_config_t *bread_model_config_get(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* BREAD_H */

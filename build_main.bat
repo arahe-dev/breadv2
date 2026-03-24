@@ -6,7 +6,7 @@ echo === Building bread.exe ===
 
 nvcc -O2 ^
      -x cu ^
-     main.cu one_layer.cu kernels.cu loader.c gguf.c tokenizer.c ^
+     main.cu one_layer.cu kernels.cu loader.c gguf.c tokenizer.c bread.c ^
      -I. ^
      -o bread.exe ^
      -Xcompiler /W3

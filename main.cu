@@ -217,6 +217,7 @@ static __global__ void f16_matvec(const half *w, const half *x,
 /* h_emb_row: caller-allocated host buffer of BREAD_HIDDEN_DIM halfs. */
 /* ------------------------------------------------------------------ */
 static void embed_token(int32_t token_id,
+                         const bread_model_config_t *cfg,
                          const loader_t *L, const gguf_ctx_t *g,
                          half *d_hidden, half *h_emb_row)
 {
@@ -226,21 +227,21 @@ static void embed_token(int32_t token_id,
     const uint8_t *emb_base = L->pinned_data + L->data_offset + et->offset;
 
     if (et->type == GGML_TYPE_Q4_K) {
-        size_t row_bytes = (size_t)(BREAD_HIDDEN_DIM / Q4K_BLOCK_ELEMS)
+        size_t row_bytes = (size_t)(cfg->hidden_dim / Q4K_BLOCK_ELEMS)
                            * Q4K_BLOCK_BYTES;
         dequant_q4k_row(emb_base + (size_t)token_id * row_bytes,
-                         h_emb_row, BREAD_HIDDEN_DIM);
+                         h_emb_row, cfg->hidden_dim);
     } else if (et->type == GGML_TYPE_F16) {
         memcpy(h_emb_row,
-               emb_base + (size_t)token_id * BREAD_HIDDEN_DIM * sizeof(half),
-               (size_t)BREAD_HIDDEN_DIM * sizeof(half));
+               emb_base + (size_t)token_id * cfg->hidden_dim * sizeof(half),
+               (size_t)cfg->hidden_dim * sizeof(half));
     } else {
         fprintf(stderr, "embed_token: unsupported type %u\n", et->type);
         exit(1);
     }
 
     CUDA_CHECK(cudaMemcpy(d_hidden, h_emb_row,
-                           BREAD_HIDDEN_DIM * sizeof(half),
+                           cfg->hidden_dim * sizeof(half),
                            cudaMemcpyHostToDevice));
 }
 
@@ -249,11 +250,12 @@ static void embed_token(int32_t token_id,
 /*                                                                      */
 /* d_norm_w: pre-loaded F32 weights already in VRAM.                  */
 /* ------------------------------------------------------------------ */
-static void apply_output_norm(half *d_hidden, const float *d_norm_w,
+static void apply_output_norm(const bread_model_config_t *cfg,
+                               half *d_hidden, const float *d_norm_w,
                                cudaStream_t stream_a)
 {
     rmsnorm_output<<<1, 256, 0, stream_a>>>(
-        d_hidden, d_norm_w, BREAD_HIDDEN_DIM, BREAD_RMS_EPS);
+        d_hidden, d_norm_w, cfg->hidden_dim, cfg->rms_eps);
     CUDA_CHECK(cudaStreamSynchronize(stream_a));
 }
 
@@ -263,20 +265,21 @@ static void apply_output_norm(half *d_hidden, const float *d_norm_w,
 /* d_output_w: pre-loaded lm_head weights in VRAM.                    */
 /* output_w_type: GGML type of d_output_w.                            */
 /* ------------------------------------------------------------------ */
-static void compute_logits(half *d_hidden,
+static void compute_logits(const bread_model_config_t *cfg,
+                             half *d_hidden,
                              void *d_output_w, uint32_t output_w_type,
                              half *d_logits, cudaStream_t stream_a)
 {
     if (output_w_type == GGML_TYPE_Q4_K) {
         bread_matvec(d_output_w, d_hidden, d_logits,
-                     BREAD_VOCAB_SIZE, BREAD_HIDDEN_DIM, QTYPE_Q4_K);
+                     cfg->vocab_size, cfg->hidden_dim, QTYPE_Q4_K);
     } else if (output_w_type == GGML_TYPE_Q6_K) {
         bread_matvec(d_output_w, d_hidden, d_logits,
-                     BREAD_VOCAB_SIZE, BREAD_HIDDEN_DIM, QTYPE_Q6_K);
+                     cfg->vocab_size, cfg->hidden_dim, QTYPE_Q6_K);
     } else if (output_w_type == GGML_TYPE_F16) {
-        f16_matvec<<<BREAD_VOCAB_SIZE, 256, 0, stream_a>>>(
+        f16_matvec<<<cfg->vocab_size, 256, 0, stream_a>>>(
             (const half *)d_output_w, d_hidden, d_logits,
-            BREAD_VOCAB_SIZE, BREAD_HIDDEN_DIM);
+            cfg->vocab_size, cfg->hidden_dim);
     } else {
         fprintf(stderr, "compute_logits: unsupported weight type %u\n",
                 output_w_type);
@@ -291,12 +294,13 @@ static void compute_logits(half *d_hidden,
 /* ------------------------------------------------------------------ */
 static int32_t greedy_sample(const half *d_logits, half *h_logits)
 {
+    const bread_model_config_t *cfg = bread_model_config_get();
     CUDA_CHECK(cudaMemcpy(h_logits, d_logits,
-                           (size_t)BREAD_VOCAB_SIZE * sizeof(half),
+                           (size_t)cfg->vocab_size * sizeof(half),
                            cudaMemcpyDeviceToHost));
     int32_t best_id  = 0;
     float   best_val = __half2float(h_logits[0]);
-    for (int i = 1; i < BREAD_VOCAB_SIZE; i++) {
+    for (int i = 1; i < cfg->vocab_size; i++) {
         float v = __half2float(h_logits[i]);
         if (v > best_val) { best_val = v; best_id = (int32_t)i; }
     }
@@ -334,6 +338,11 @@ int main(int argc, char **argv)
     /* -- Open GGUF for metadata ------------------------------------- */
     gguf_ctx_t *g = gguf_open(model_path);
     if (!g) { fprintf(stderr, "gguf_open failed\n"); return 1; }
+    if (bread_model_config_init(model_path, g) != 0) {
+        fprintf(stderr, "bread_model_config_init failed\n");
+        return 1;
+    }
+    const bread_model_config_t *cfg = bread_model_config_get();
 
     /* -- Load tokenizer --------------------------------------------- */
     printf("[2/4] Loading tokenizer...\n");
@@ -394,13 +403,13 @@ int main(int argc, char **argv)
 
     half *d_hidden = NULL;
     half *d_logits = NULL;
-    CUDA_CHECK(cudaMalloc(&d_hidden, BREAD_HIDDEN_DIM * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&d_hidden, cfg->hidden_dim * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&d_logits,
-                           (size_t)BREAD_VOCAB_SIZE * sizeof(half)));
+                           (size_t)cfg->vocab_size * sizeof(half)));
 
     /* Host buffers reused across tokens */
-    half *h_emb_row = (half *)malloc(BREAD_HIDDEN_DIM * sizeof(half));
-    half *h_logits  = (half *)malloc((size_t)BREAD_VOCAB_SIZE * sizeof(half));
+    half *h_emb_row = (half *)malloc(cfg->hidden_dim * sizeof(half));
+    half *h_logits  = (half *)malloc((size_t)cfg->vocab_size * sizeof(half));
     if (!h_emb_row || !h_logits) {
         fprintf(stderr, "malloc failed\n"); return 1;
     }
@@ -415,8 +424,8 @@ int main(int argc, char **argv)
     double t_prefill_start = now_ms();
 
     for (int p = 0; p < n_prompt; p++) {
-        embed_token(token_buf[p], L, g, d_hidden, h_emb_row);
-        for (int layer = 0; layer < BREAD_NUM_LAYERS; layer++)
+        embed_token(token_buf[p], cfg, L, g, d_hidden, h_emb_row);
+        for (int layer = 0; layer < cfg->num_layers; layer++)
             one_layer_forward(d_hidden, layer, p, L, g, stream_a);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -431,8 +440,8 @@ int main(int argc, char **argv)
      * ================================================================ */
     double t_ttft_start = now_ms();
 
-    apply_output_norm(d_hidden, d_norm_w, stream_a);
-    compute_logits(d_hidden, d_output_w, out_t->type, d_logits, stream_a);
+    apply_output_norm(cfg, d_hidden, d_norm_w, stream_a);
+    compute_logits(cfg, d_hidden, d_output_w, out_t->type, d_logits, stream_a);
     int32_t next_tok = greedy_sample(d_logits, h_logits);
 
     double t_ttft_done = now_ms();
@@ -455,14 +464,14 @@ int main(int argc, char **argv)
     double  t_gen_start = now_ms();
 
     while (n_gen < max_tokens && next_tok != eos) {
-        embed_token(next_tok, L, g, d_hidden, h_emb_row);
+        embed_token(next_tok, cfg, L, g, d_hidden, h_emb_row);
 
-        for (int layer = 0; layer < BREAD_NUM_LAYERS; layer++)
+        for (int layer = 0; layer < cfg->num_layers; layer++)
             one_layer_forward(d_hidden, layer, n_prompt + n_gen, L, g, stream_a);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        apply_output_norm(d_hidden, d_norm_w, stream_a);
-        compute_logits(d_hidden, d_output_w, out_t->type, d_logits, stream_a);
+        apply_output_norm(cfg, d_hidden, d_norm_w, stream_a);
+        compute_logits(cfg, d_hidden, d_output_w, out_t->type, d_logits, stream_a);
         next_tok = greedy_sample(d_logits, h_logits);
 
         if (next_tok != eos) {

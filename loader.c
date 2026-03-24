@@ -225,7 +225,12 @@ loader_t *loader_init(const char *model_path) {
         CUDA_CHECK(cudaMalloc((void **)&L->vram_slots[i], (size_t)max_expert_total));
     }
 
-    /* ---- Step 4: Load full model file into pinned RAM ---- */
+    /* ---- Step 4: Load full model file into host RAM ----
+     *
+     * Using cudaMallocHost for the full 20+ GB GGUF can exhaust CUDA's
+     * GPU-visible virtual address space on Windows/WDDM.  Keep the blob
+     * in normal RAM for stability; expert transfers may be less overlapped
+     * for now, but the runtime remains functional. */
     uint64_t fsz = file_size(model_path);
     if (fsz == 0) {
         fprintf(stderr, "loader: cannot determine file size\n");
@@ -235,28 +240,20 @@ loader_t *loader_init(const char *model_path) {
     }
     L->pinned_size = fsz;
 
-    fprintf(stderr, "loader: allocating %.2f GB pinned host memory...\n", fsz / 1e9);
-    cudaError_t alloc_err = cudaMallocHost((void **)&L->pinned_data, (size_t)fsz);
-    if (alloc_err != cudaSuccess) {
-        fprintf(stderr, "loader: cudaMallocHost failed: %s\n", cudaGetErrorString(alloc_err));
-        fprintf(stderr, "loader: falling back to regular malloc (DMA will be synchronous)\n");
-        L->pinned_data = (uint8_t *)malloc((size_t)fsz);
-        if (!L->pinned_data) {
-            fprintf(stderr, "loader: malloc(%llu) also failed — out of memory\n",
-                    (unsigned long long)fsz);
-            gguf_close(ctx);
-            free(L);
-            return NULL;
-        }
-        L->is_pinned = 0;
-    } else {
-        L->is_pinned = 1;
+    fprintf(stderr, "loader: allocating %.2f GB host memory...\n", fsz / 1e9);
+    L->pinned_data = (uint8_t *)malloc((size_t)fsz);
+    if (!L->pinned_data) {
+        fprintf(stderr, "loader: malloc(%llu) failed — out of memory\n",
+                (unsigned long long)fsz);
+        gguf_close(ctx);
+        free(L);
+        return NULL;
     }
+    L->is_pinned = 0;
 
     if (read_file_into(model_path, L->pinned_data, fsz) != 0) {
         fprintf(stderr, "loader: failed to read model file\n");
-        if (L->is_pinned) cudaFreeHost(L->pinned_data);
-        else free(L->pinned_data);
+        free(L->pinned_data);
         gguf_close(ctx);
         free(L);
         return NULL;
@@ -291,7 +288,7 @@ loader_t *loader_init(const char *model_path) {
     gguf_close(ctx);
 
     fprintf(stderr, "loader: ready (%s RAM, %d VRAM slots)\n",
-            L->is_pinned ? "pinned" : "unpinned", LOADER_NUM_SLOTS);
+            L->is_pinned ? "pinned" : "host", LOADER_NUM_SLOTS);
     return L;
 }
 
@@ -314,8 +311,7 @@ void loader_free(loader_t *L) {
         if (L->vram_slots[i]) cudaFree(L->vram_slots[i]);
     }
     if (L->pinned_data) {
-        if (L->is_pinned) cudaFreeHost(L->pinned_data);
-        else free(L->pinned_data);
+        free(L->pinned_data);
     }
     free(L);
 }

@@ -1,10 +1,12 @@
 #ifndef LOADER_H
 #define LOADER_H
 
-/* loader.h — async RAM→VRAM expert weight streaming for BREAD.
+/* loader.h — RAM→VRAM expert weight streaming for BREAD.
  *
- * Loads the full model file into pinned (page-locked) host memory so
- * cudaMemcpyAsync can DMA expert weights to VRAM without CPU involvement.
+ * Loads the full model file into host memory. On Windows/WDDM, pinning
+ * an entire 20+ GB GGUF via cudaMallocHost can exhaust GPU-visible VA
+ * space even when VRAM itself is mostly free, so the loader keeps the
+ * whole blob in normal RAM for stability.
  *
  * Expert weights are cached in VRAM slots with LRU eviction.
  * The inference loop calls:
@@ -75,10 +77,10 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    /* Pinned host memory holding the full model file */
+    /* Host memory holding the full model file */
     uint8_t *pinned_data;
     uint64_t pinned_size;         /* file size in bytes */
-    int      is_pinned;           /* 1 = cudaMallocHost, 0 = malloc fallback */
+    int      is_pinned;           /* always 0 for now; reserved for future staging */
 
     /* GGUF metadata */
     uint64_t data_offset;         /* absolute byte offset of GGUF data section */

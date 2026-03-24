@@ -149,20 +149,52 @@ static __global__ void copy_half(half *dst, const half *src, int n)
 /* ------------------------------------------------------------------ */
 
 /* Pointer to tensor data in pinned host RAM */
-static uint8_t *tensor_ram(const loader_t *L, const gguf_ctx_t *g,
-                             const char *name)
+static const gguf_tensor_t *require_tensor(const gguf_ctx_t *g, const char *name)
 {
     const gguf_tensor_t *t = gguf_find_tensor(g, name);
-    if (!t) { fprintf(stderr, "tensor not found: %s\n", name); return NULL; }
+    if (!t) {
+        fprintf(stderr, "tensor not found: %s\n", name);
+        exit(1);
+    }
+    return t;
+}
+
+static uint8_t *tensor_ram(const loader_t *L, const gguf_ctx_t *g,
+                           const char *name)
+{
+    const gguf_tensor_t *t = require_tensor(g, name);
     return L->pinned_data + L->data_offset + t->offset;
+}
+
+static const float *tensor_ram_f32(const loader_t *L, const gguf_ctx_t *g,
+                                   const char *name)
+{
+    const gguf_tensor_t *t = require_tensor(g, name);
+    if (t->type != GGML_TYPE_F32) {
+        fprintf(stderr, "tensor type mismatch: %s expected F32 got %s\n",
+                name, ggml_type_name(t->type));
+        exit(1);
+    }
+    return (const float *)(L->pinned_data + L->data_offset + t->offset);
+}
+
+static const half *tensor_ram_f16(const loader_t *L, const gguf_ctx_t *g,
+                                  const char *name)
+{
+    const gguf_tensor_t *t = require_tensor(g, name);
+    if (t->type != GGML_TYPE_F16) {
+        fprintf(stderr, "tensor type mismatch: %s expected F16 got %s\n",
+                name, ggml_type_name(t->type));
+        exit(1);
+    }
+    return (const half *)(L->pinned_data + L->data_offset + t->offset);
 }
 
 /* Allocate VRAM and copy a tensor from pinned RAM */
 static void *load_vram(const loader_t *L, const gguf_ctx_t *g,
                         const char *name)
 {
-    const gguf_tensor_t *t = gguf_find_tensor(g, name);
-    if (!t) { fprintf(stderr, "tensor not found: %s\n", name); return NULL; }
+    const gguf_tensor_t *t = require_tensor(g, name);
     void *d;
     CUDA_CHECK(cudaMalloc(&d, t->size));
     CUDA_CHECK(cudaMemcpy(d, L->pinned_data + L->data_offset + t->offset,
@@ -249,7 +281,7 @@ static void cpu_conv1d_step(const float *conv_state,
         for (int k = 0; k < kernel_size - 1; k++)
             acc += conv_state[k * channels + c] * weight[c * kernel_size + k];
         acc += new_input[c] * weight[c * kernel_size + (kernel_size - 1)];
-        out[c] = acc / (1.0f + expf(-acc));
+        out[c] = acc;
     }
 }
 
@@ -262,6 +294,39 @@ static void cpu_gated_rms_norm(const float *x, const float *z,
     for (int i = 0; i < n; i++) {
         float silu_z = z[i] / (1.0f + expf(-z[i]));
         out[i] = x[i] * inv_rms * w[i] * silu_z;
+    }
+}
+
+static void apply_rotary_emb(float *q, float *k, int pos, float rope_freq_base,
+                             int num_q_heads, int num_kv_heads,
+                             int head_dim, int rotary_dim)
+{
+    int half = rotary_dim / 2;
+    for (int h = 0; h < num_q_heads; h++) {
+        float *qh = q + h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float freq = 1.0f / powf(rope_freq_base, (float)(2 * i) / rotary_dim);
+            float angle = (float)pos * freq;
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
+            float q0 = qh[i];
+            float q1 = qh[i + half];
+            qh[i]        = q0 * cos_a - q1 * sin_a;
+            qh[i + half] = q0 * sin_a + q1 * cos_a;
+        }
+    }
+    for (int h = 0; h < num_kv_heads; h++) {
+        float *kh = k + h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float freq = 1.0f / powf(rope_freq_base, (float)(2 * i) / rotary_dim);
+            float angle = (float)pos * freq;
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
+            float k0 = kh[i];
+            float k1 = kh[i + half];
+            kh[i]        = k0 * cos_a - k1 * sin_a;
+            kh[i + half] = k0 * sin_a + k1 * cos_a;
+        }
     }
 }
 
@@ -282,9 +347,10 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                         loader_t *L, gguf_ctx_t *g,
                         cudaStream_t stream_a)
 {
+    const bread_model_config_t *cfg = bread_model_config_get();
     char nm[128];   /* tensor name buffer */
-    int H = BREAD_HIDDEN_DIM;
-    int is_full = BREAD_IS_FULL_ATTN(layer_idx);
+    int H = cfg->hidden_dim;
+    int is_full = ((layer_idx % 4) == 3);
 
     /* ---- Persistent scratch VRAM (allocated once, reused) ---- */
     static half *d_normed   = NULL;   /* H — pre-attn normalised state  */
@@ -312,49 +378,75 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     static float *h_conv_out = NULL;
     static float *h_attn_out = NULL;
     static float *h_head_tmp = NULL;
-    static float *ssm_conv_state[BREAD_NUM_LAYERS] = {0};
-    static float *ssm_state[BREAD_NUM_LAYERS] = {0};
+    static float *h_q_full   = NULL;
+    static float *h_kv_k     = NULL;
+    static float *h_kv_v     = NULL;
+    static float *h_q_score  = NULL;
+    static float *h_q_gate   = NULL;
+    static float *h_scores   = NULL;
+    static float *ssm_conv_state[LOADER_MAX_LAYERS] = {0};
+    static float *ssm_state[LOADER_MAX_LAYERS] = {0};
+    static float *kv_k_cache[LOADER_MAX_LAYERS] = {0};
+    static float *kv_v_cache[LOADER_MAX_LAYERS] = {0};
+    static int    kv_cache_len[LOADER_MAX_LAYERS] = {0};
 
     if (!d_normed) {
         CUDA_CHECK(cudaMalloc(&d_normed,   H                          * sizeof(half)));
         CUDA_CHECK(cudaMalloc(&d_normed2,  H                          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_q,        BREAD_Q_PROJ_DIM           * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_k,        BREAD_KV_PROJ_DIM          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_v,        BREAD_KV_PROJ_DIM          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_attn_out, BREAD_ATTN_OUT_DIM         * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_q,        cfg->q_proj_dim            * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_k,        cfg->kv_proj_dim           * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_v,        cfg->kv_proj_dim           * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_attn_out, cfg->attn_out_dim          * sizeof(half)));
         CUDA_CHECK(cudaMalloc(&d_o_out,    H                          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_sg,       BREAD_SHARED_INTER         * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_su,       BREAD_SHARED_INTER         * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_sg,       cfg->shared_inter          * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_su,       cfg->shared_inter          * sizeof(half)));
         CUDA_CHECK(cudaMalloc(&d_sh_out,   H                          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_eg,       BREAD_EXPERT_INTER         * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_eu,       BREAD_EXPERT_INTER         * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_eg,       cfg->expert_inter          * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_eu,       cfg->expert_inter          * sizeof(half)));
         CUDA_CHECK(cudaMalloc(&d_eo,       H                          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_qkv,      BREAD_SSM_QKV_DIM          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_z,        BREAD_SSM_Z_DIM            * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_alpha,    BREAD_SSM_NUM_V_HEADS      * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_beta,     BREAD_SSM_NUM_V_HEADS      * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_qkv,      cfg->ssm_qkv_dim           * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_z,        cfg->ssm_z_dim             * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_alpha,    cfg->ssm_num_v_heads       * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&d_beta,     cfg->ssm_num_v_heads       * sizeof(half)));
 
-        h_qkv      = (float *)malloc(BREAD_SSM_QKV_DIM * sizeof(float));
-        h_z        = (float *)malloc(BREAD_SSM_Z_DIM * sizeof(float));
-        h_alpha    = (float *)malloc(BREAD_SSM_NUM_V_HEADS * sizeof(float));
-        h_beta     = (float *)malloc(BREAD_SSM_NUM_V_HEADS * sizeof(float));
-        h_conv_out = (float *)malloc(BREAD_SSM_QKV_DIM * sizeof(float));
-        h_attn_out = (float *)malloc(BREAD_SSM_Z_DIM * sizeof(float));
-        h_head_tmp = (float *)malloc(BREAD_SSM_HEAD_DIM * sizeof(float));
-        if (!h_qkv || !h_z || !h_alpha || !h_beta || !h_conv_out || !h_attn_out || !h_head_tmp) {
+        h_qkv      = (float *)malloc(cfg->ssm_qkv_dim * sizeof(float));
+        h_z        = (float *)malloc(cfg->ssm_z_dim * sizeof(float));
+        h_alpha    = (float *)malloc(cfg->ssm_num_v_heads * sizeof(float));
+        h_beta     = (float *)malloc(cfg->ssm_num_v_heads * sizeof(float));
+        h_conv_out = (float *)malloc(cfg->ssm_qkv_dim * sizeof(float));
+        h_attn_out = (float *)malloc(cfg->attn_out_dim * sizeof(float));
+        h_head_tmp = (float *)malloc(cfg->ssm_head_dim * sizeof(float));
+        h_q_full   = (float *)malloc(cfg->q_proj_dim * sizeof(float));
+        h_kv_k     = (float *)malloc(cfg->kv_proj_dim * sizeof(float));
+        h_kv_v     = (float *)malloc(cfg->kv_proj_dim * sizeof(float));
+        h_q_score  = (float *)malloc(cfg->attn_out_dim * sizeof(float));
+        h_q_gate   = (float *)malloc(cfg->attn_out_dim * sizeof(float));
+        h_scores   = (float *)malloc(cfg->kv_cache_len * sizeof(float));
+        if (!h_qkv || !h_z || !h_alpha || !h_beta || !h_conv_out || !h_attn_out ||
+            !h_head_tmp || !h_q_full || !h_kv_k || !h_kv_v || !h_q_score || !h_q_gate || !h_scores) {
             fprintf(stderr, "one_layer_forward: host scratch alloc failed\n");
             exit(1);
         }
 
-        for (int layer = 0; layer < BREAD_NUM_LAYERS; layer++) {
-            if (BREAD_IS_FULL_ATTN(layer)) continue;
-            ssm_conv_state[layer] = (float *)calloc(
-                (BREAD_SSM_CONV_KERNEL - 1) * BREAD_SSM_QKV_DIM, sizeof(float));
-            ssm_state[layer] = (float *)calloc(
-                BREAD_SSM_NUM_V_HEADS * BREAD_SSM_HEAD_DIM * BREAD_SSM_HEAD_DIM, sizeof(float));
-            if (!ssm_conv_state[layer] || !ssm_state[layer]) {
-                fprintf(stderr, "one_layer_forward: SSM state alloc failed for layer %d\n", layer);
-                exit(1);
+        for (int layer = 0; layer < cfg->num_layers; layer++) {
+            if (((layer % 4) == 3)) {
+                kv_k_cache[layer] = (float *)calloc(
+                    cfg->kv_cache_len * cfg->kv_proj_dim, sizeof(float));
+                kv_v_cache[layer] = (float *)calloc(
+                    cfg->kv_cache_len * cfg->kv_proj_dim, sizeof(float));
+                if (!kv_k_cache[layer] || !kv_v_cache[layer]) {
+                    fprintf(stderr, "one_layer_forward: KV cache alloc failed for layer %d\n", layer);
+                    exit(1);
+                }
+            } else {
+                ssm_conv_state[layer] = (float *)calloc(
+                    (cfg->ssm_conv_kernel - 1) * cfg->ssm_qkv_dim, sizeof(float));
+                ssm_state[layer] = (float *)calloc(
+                    cfg->ssm_num_v_heads * cfg->ssm_head_dim * cfg->ssm_head_dim, sizeof(float));
+                if (!ssm_conv_state[layer] || !ssm_state[layer]) {
+                    fprintf(stderr, "one_layer_forward: SSM state alloc failed for layer %d\n", layer);
+                    exit(1);
+                }
             }
         }
     }
@@ -372,7 +464,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         int blocks = (H + 255) / 256;
         copy_half<<<blocks, 256, 0, stream_a>>>(d_normed, d_hidden, H);
         rmsnorm_inplace<<<1, 256, 0, stream_a>>>(d_normed, d_attn_norm_w,
-                                                  H, BREAD_RMS_EPS);
+                                                  H, cfg->rms_eps);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         cudaFree(d_attn_norm_w);
     }
@@ -392,29 +484,117 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         void *d_vw = load_vram(L, g, nm);
 
         bread_matvec(d_qw, d_normed, d_q,
-                     BREAD_Q_PROJ_DIM,  H, GGML_TYPE_Q4_K);
+                     cfg->q_proj_dim,  H, GGML_TYPE_Q4_K);
         bread_matvec(d_kw, d_normed, d_k,
-                     BREAD_KV_PROJ_DIM, H, GGML_TYPE_Q4_K);
+                     cfg->kv_proj_dim, H, GGML_TYPE_Q4_K);
         bread_matvec(d_vw, d_normed, d_v,
-                     BREAD_KV_PROJ_DIM, H, GGML_TYPE_Q6_K);
+                     cfg->kv_proj_dim, H, GGML_TYPE_Q6_K);
 
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         cudaFree(d_qw); cudaFree(d_kw); cudaFree(d_vw);
     }
 
     /* ================================================================
-     * CPU attention: single-token (pos=0)
+     * CPU attention
      *
-     * For pos=0 there is exactly one KV entry.
-     * softmax([[score]]) = [[1.0]] → attn_out = V expanded to Q heads.
-     * Q and K are computed but their dot-product is irrelevant (scalar
-     * softmax = 1.0 regardless).  Skip RoPE and QK-norm for Step 2.
+     * Full-attn layers use CPU-side incremental RoPE + KV cache.
+     * SSM layers use the gated delta recurrence.
      * ================================================================ */
     if (is_full) {
-        /* GQA expand: tile V across Q heads (2 KV heads → 16 Q heads) */
-        gqa_expand_v<<<BREAD_NUM_Q_HEADS, BREAD_HEAD_DIM_V, 0, stream_a>>>(
-            d_attn_out, d_v,
-            BREAD_NUM_Q_HEADS, BREAD_NUM_KV_HEADS, BREAD_HEAD_DIM_V);
+        const float *q_norm_w;
+        const float *k_norm_w;
+        int heads_per_kv = cfg->num_q_heads / cfg->num_kv_heads;
+        int kv_len;
+
+        vram_half_to_cpu_float(d_q, h_q_full, cfg->q_proj_dim);
+        vram_half_to_cpu_float(d_k, h_kv_k, cfg->kv_proj_dim);
+        vram_half_to_cpu_float(d_v, h_kv_v, cfg->kv_proj_dim);
+
+        for (int h = 0; h < cfg->num_q_heads; h++) {
+            memcpy(h_q_score + h * cfg->head_dim_qk,
+                   h_q_full + h * (cfg->head_dim_qk + cfg->head_dim_qgate),
+                   cfg->head_dim_qk * sizeof(float));
+            memcpy(h_q_gate + h * cfg->head_dim_v,
+                   h_q_full + h * (cfg->head_dim_qk + cfg->head_dim_qgate) + cfg->head_dim_qk,
+                   cfg->head_dim_v * sizeof(float));
+        }
+
+        snprintf(nm, sizeof(nm), "blk.%d.attn_q_norm.weight", layer_idx);
+        q_norm_w = tensor_ram_f32(L, g, nm);
+        snprintf(nm, sizeof(nm), "blk.%d.attn_k_norm.weight", layer_idx);
+        k_norm_w = tensor_ram_f32(L, g, nm);
+
+        for (int h = 0; h < cfg->num_q_heads; h++) {
+            float *qh = h_q_score + h * cfg->head_dim_qk;
+            float sum_sq = 0.0f;
+            for (int i = 0; i < cfg->head_dim_qk; i++) sum_sq += qh[i] * qh[i];
+            {
+                float inv_rms = 1.0f / sqrtf(sum_sq / (float)cfg->head_dim_qk + cfg->rms_eps);
+                for (int i = 0; i < cfg->head_dim_qk; i++)
+                    qh[i] = qh[i] * inv_rms * q_norm_w[i];
+            }
+        }
+        for (int h = 0; h < cfg->num_kv_heads; h++) {
+            float *kh = h_kv_k + h * cfg->head_dim_qk;
+            float sum_sq = 0.0f;
+            for (int i = 0; i < cfg->head_dim_qk; i++) sum_sq += kh[i] * kh[i];
+            {
+                float inv_rms = 1.0f / sqrtf(sum_sq / (float)cfg->head_dim_qk + cfg->rms_eps);
+                for (int i = 0; i < cfg->head_dim_qk; i++)
+                    kh[i] = kh[i] * inv_rms * k_norm_w[i];
+            }
+        }
+
+        apply_rotary_emb(h_q_score, h_kv_k, pos, cfg->rope_freq_base,
+                         cfg->num_q_heads, cfg->num_kv_heads,
+                         cfg->head_dim_qk, cfg->head_dim_rope);
+
+        if (kv_cache_len[layer_idx] >= cfg->kv_cache_len) {
+            fprintf(stderr, "one_layer_forward: KV cache full at layer %d\n", layer_idx);
+            exit(1);
+        }
+
+        memcpy(kv_k_cache[layer_idx] + (size_t)kv_cache_len[layer_idx] * cfg->kv_proj_dim,
+               h_kv_k, cfg->kv_proj_dim * sizeof(float));
+        memcpy(kv_v_cache[layer_idx] + (size_t)kv_cache_len[layer_idx] * cfg->kv_proj_dim,
+               h_kv_v, cfg->kv_proj_dim * sizeof(float));
+        kv_cache_len[layer_idx]++;
+        kv_len = kv_cache_len[layer_idx];
+
+        memset(h_attn_out, 0, cfg->attn_out_dim * sizeof(float));
+        for (int h = 0; h < cfg->num_q_heads; h++) {
+            int kv_h = h / heads_per_kv;
+            float *qh = h_q_score + h * cfg->head_dim_qk;
+            float *oh = h_attn_out + h * cfg->head_dim_v;
+            for (int p = 0; p < kv_len; p++) {
+                float *kp = kv_k_cache[layer_idx] + (size_t)p * cfg->kv_proj_dim + kv_h * cfg->head_dim_qk;
+                float dot = 0.0f;
+                for (int d = 0; d < cfg->head_dim_qk; d++)
+                    dot += qh[d] * kp[d];
+                h_scores[p] = dot / sqrtf((float)cfg->head_dim_qk);
+            }
+            cpu_softmax(h_scores, kv_len);
+            for (int p = 0; p < kv_len; p++) {
+                float *vp = kv_v_cache[layer_idx] + (size_t)p * cfg->kv_proj_dim + kv_h * cfg->head_dim_v;
+                for (int d = 0; d < cfg->head_dim_v; d++)
+                    oh[d] += h_scores[p] * vp[d];
+            }
+            for (int d = 0; d < cfg->head_dim_v; d++) {
+                float gate = cpu_sigmoid(h_q_gate[h * cfg->head_dim_v + d]);
+                oh[d] *= gate;
+            }
+        }
+
+        {
+            half *h_attn_half = (half *)malloc(cfg->attn_out_dim * sizeof(half));
+            if (!h_attn_half) { fprintf(stderr, "one_layer_forward: attn half alloc failed\n"); exit(1); }
+            for (int i = 0; i < cfg->attn_out_dim; i++)
+                h_attn_half[i] = __float2half(h_attn_out[i]);
+            CUDA_CHECK(cudaMemcpy(d_attn_out, h_attn_half,
+                                  cfg->attn_out_dim * sizeof(half),
+                                  cudaMemcpyHostToDevice));
+            free(h_attn_half);
+        }
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
     } else {
         const float *conv_w;
@@ -434,13 +614,13 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         void *d_beta_w = load_vram(L, g, nm);
 
         bread_matvec(d_qkv_w, d_normed, d_qkv,
-                     BREAD_SSM_QKV_DIM, H, GGML_TYPE_Q4_K);
+                     cfg->ssm_qkv_dim, H, GGML_TYPE_Q4_K);
         bread_matvec(d_gate_w, d_normed, d_z,
-                     BREAD_SSM_Z_DIM, H, GGML_TYPE_Q4_K);
+                     cfg->ssm_z_dim, H, GGML_TYPE_Q4_K);
         bread_matvec(d_alpha_w, d_normed, d_alpha,
-                     BREAD_SSM_NUM_V_HEADS, H, GGML_TYPE_Q4_K);
+                     cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K);
         bread_matvec(d_beta_w, d_normed, d_beta,
-                     BREAD_SSM_NUM_V_HEADS, H, GGML_TYPE_Q4_K);
+                     cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         cudaFree(d_qkv_w);
@@ -448,39 +628,38 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         cudaFree(d_alpha_w);
         cudaFree(d_beta_w);
 
-        vram_half_to_cpu_float(d_qkv, h_qkv, BREAD_SSM_QKV_DIM);
-        vram_half_to_cpu_float(d_z, h_z, BREAD_SSM_Z_DIM);
-        vram_half_to_cpu_float(d_alpha, h_alpha, BREAD_SSM_NUM_V_HEADS);
-        vram_half_to_cpu_float(d_beta, h_beta, BREAD_SSM_NUM_V_HEADS);
+        vram_half_to_cpu_float(d_qkv, h_qkv, cfg->ssm_qkv_dim);
+        vram_half_to_cpu_float(d_z, h_z, cfg->ssm_z_dim);
+        vram_half_to_cpu_float(d_alpha, h_alpha, cfg->ssm_num_v_heads);
+        vram_half_to_cpu_float(d_beta, h_beta, cfg->ssm_num_v_heads);
 
         snprintf(nm, sizeof(nm), "blk.%d.ssm_conv1d.weight", layer_idx);
-        conv_w = (const float *)tensor_ram(L, g, nm);
+        conv_w = tensor_ram_f32(L, g, nm);
         snprintf(nm, sizeof(nm), "blk.%d.ssm_a", layer_idx);
-        ssm_a = (const float *)tensor_ram(L, g, nm);
+        ssm_a = tensor_ram_f32(L, g, nm);
         snprintf(nm, sizeof(nm), "blk.%d.ssm_dt", layer_idx);
-        ssm_dt = (const float *)tensor_ram(L, g, nm);
+        ssm_dt = tensor_ram_f32(L, g, nm);
         snprintf(nm, sizeof(nm), "blk.%d.ssm_norm.weight", layer_idx);
-        ssm_norm_w = (const float *)tensor_ram(L, g, nm);
+        ssm_norm_w = tensor_ram_f32(L, g, nm);
         conv_state = ssm_conv_state[layer_idx];
         layer_state = ssm_state[layer_idx];
-
-        if (!conv_w || !ssm_a || !ssm_dt || !ssm_norm_w || !conv_state || !layer_state) {
-            fprintf(stderr, "one_layer_forward: missing SSM tensors for layer %d\n", layer_idx);
+        if (!conv_state || !layer_state) {
+            fprintf(stderr, "one_layer_forward: missing SSM state for layer %d\n", layer_idx);
             exit(1);
         }
 
         cpu_conv1d_step(conv_state, h_qkv, conv_w, h_conv_out,
-                        BREAD_SSM_QKV_DIM, BREAD_SSM_CONV_KERNEL);
-        memmove(conv_state, conv_state + BREAD_SSM_QKV_DIM,
-                (BREAD_SSM_CONV_KERNEL - 2) * BREAD_SSM_QKV_DIM * sizeof(float));
-        memcpy(conv_state + (BREAD_SSM_CONV_KERNEL - 2) * BREAD_SSM_QKV_DIM,
-               h_qkv, BREAD_SSM_QKV_DIM * sizeof(float));
+                        cfg->ssm_qkv_dim, cfg->ssm_conv_kernel);
+        memmove(conv_state, conv_state + cfg->ssm_qkv_dim,
+                (cfg->ssm_conv_kernel - 2) * cfg->ssm_qkv_dim * sizeof(float));
+        memcpy(conv_state + (cfg->ssm_conv_kernel - 2) * cfg->ssm_qkv_dim,
+               h_qkv, cfg->ssm_qkv_dim * sizeof(float));
 
         {
-            const int key_dim = BREAD_SSM_HEAD_DIM;
-            const int value_dim = BREAD_SSM_HEAD_DIM;
-            const int num_k_heads = BREAD_SSM_NUM_K_HEADS;
-            const int num_v_heads = BREAD_SSM_NUM_V_HEADS;
+            const int key_dim = cfg->ssm_head_dim;
+            const int value_dim = cfg->ssm_head_dim;
+            const int num_k_heads = cfg->ssm_num_k_heads;
+            const int num_v_heads = cfg->ssm_num_v_heads;
             const int k_heads_per_v = num_v_heads / num_k_heads;
             const float inv_scale = 1.0f / sqrtf((float)key_dim);
             float *lin_q = h_conv_out;
@@ -489,12 +668,12 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
             for (int h = 0; h < num_k_heads; h++) {
                 float *qh = lin_q + h * key_dim;
-                cpu_rms_norm_bare(qh, key_dim, BREAD_RMS_EPS);
+                cpu_rms_norm_bare(qh, key_dim, cfg->rms_eps);
                 for (int d = 0; d < key_dim; d++) qh[d] *= inv_scale * inv_scale;
             }
             for (int h = 0; h < num_k_heads; h++) {
                 float *kh = lin_k + h * key_dim;
-                cpu_rms_norm_bare(kh, key_dim, BREAD_RMS_EPS);
+                cpu_rms_norm_bare(kh, key_dim, cfg->rms_eps);
                 for (int d = 0; d < key_dim; d++) kh[d] *= inv_scale;
             }
 
@@ -510,33 +689,45 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
                 for (int vi = 0; vi < value_dim; vi++) {
                     float *row = S + (size_t)vi * key_dim;
-                    float kv_mem = 0.0f;
-                    for (int ki = 0; ki < key_dim; ki++) {
+                    for (int ki = 0; ki < key_dim; ki++)
                         row[ki] *= decay;
-                        kv_mem += row[ki] * k_h[ki];
-                    }
+                }
 
-                    float delta = (v_h[vi] - kv_mem) * beta_gate;
-                    float out = 0.0f;
-                    for (int ki = 0; ki < key_dim; ki++) {
-                        row[ki] += delta * k_h[ki];
-                        out += row[ki] * q_h[ki];
+                for (int vi = 0; vi < value_dim; vi++) {
+                    float *row = S + (size_t)vi * key_dim;
+                    float kv_mem = 0.0f;
+                    for (int ki = 0; ki < key_dim; ki++)
+                        kv_mem += row[ki] * k_h[ki];
+
+                    {
+                        float delta = (v_h[vi] - kv_mem) * beta_gate;
+                        for (int ki = 0; ki < key_dim; ki++)
+                            row[ki] += delta * k_h[ki];
                     }
+                }
+
+                for (int vi = 0; vi < value_dim; vi++) {
+                    float *row = S + (size_t)vi * key_dim;
+                    float out = 0.0f;
+                    for (int ki = 0; ki < key_dim; ki++)
+                        out += row[ki] * q_h[ki];
                     h_head_tmp[vi] = out;
                 }
 
                 cpu_gated_rms_norm(h_head_tmp, h_z + vh * value_dim,
-                                   ssm_norm_w, o_h, value_dim, BREAD_RMS_EPS);
+                                   ssm_norm_w, o_h, value_dim, cfg->rms_eps);
             }
         }
 
         {
-            half h_attn_half[BREAD_SSM_Z_DIM];
-            for (int i = 0; i < BREAD_SSM_Z_DIM; i++)
+            half *h_attn_half = (half *)malloc(cfg->ssm_z_dim * sizeof(half));
+            if (!h_attn_half) { fprintf(stderr, "one_layer_forward: ssm half alloc failed\n"); exit(1); }
+            for (int i = 0; i < cfg->ssm_z_dim; i++)
                 h_attn_half[i] = __float2half(h_attn_out[i]);
             CUDA_CHECK(cudaMemcpy(d_attn_out, h_attn_half,
-                                  BREAD_SSM_Z_DIM * sizeof(half),
+                                  cfg->ssm_z_dim * sizeof(half),
                                   cudaMemcpyHostToDevice));
+            free(h_attn_half);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
     }
@@ -552,7 +743,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         void *d_ow = load_vram(L, g, nm);
 
         bread_matvec(d_ow, d_attn_out, d_o_out,
-                     H, BREAD_ATTN_OUT_DIM, GGML_TYPE_Q4_K);
+                     H, cfg->attn_out_dim, GGML_TYPE_Q4_K);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         cudaFree(d_ow);
 
@@ -564,7 +755,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         void *d_sw = load_vram(L, g, nm);
 
         bread_matvec(d_sw, d_attn_out, d_o_out,
-                     H, BREAD_SSM_Z_DIM, GGML_TYPE_Q4_K);
+                     H, cfg->ssm_z_dim, GGML_TYPE_Q4_K);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         cudaFree(d_sw);
 
@@ -583,7 +774,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         int blocks = (H + 255) / 256;
         copy_half<<<blocks, 256, 0, stream_a>>>(d_normed2, d_hidden, H);
         rmsnorm_inplace<<<1, 256, 0, stream_a>>>(d_normed2, d_pan_w,
-                                                  H, BREAD_RMS_EPS);
+                                                  H, cfg->rms_eps);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         cudaFree(d_pan_w);
     }
@@ -598,9 +789,9 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         void *d_su_w = load_vram(L, g, nm);
 
         bread_matvec(d_sg_w, d_normed2, d_sg,
-                     BREAD_SHARED_INTER, H, GGML_TYPE_Q4_K);
+                     cfg->shared_inter, H, GGML_TYPE_Q4_K);
         bread_matvec(d_su_w, d_normed2, d_su,
-                     BREAD_SHARED_INTER, H, GGML_TYPE_Q4_K);
+                     cfg->shared_inter, H, GGML_TYPE_Q4_K);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         cudaFree(d_sg_w); cudaFree(d_su_w);
     }
@@ -610,66 +801,87 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
      *
      * router weight: blk.N.ffn_gate_inp.weight [H × NUM_EXPERTS] F32
      * ================================================================ */
-    int   expert_indices[BREAD_TOP_K];
-    float expert_weights[BREAD_TOP_K];
+    int   *expert_indices = NULL;
+    float *expert_weights = NULL;
+    float shared_gate_score = 0.0f;
     {
+        expert_indices = (int *)malloc(cfg->top_k * sizeof(int));
+        expert_weights = (float *)malloc(cfg->top_k * sizeof(float));
+        if (!expert_indices || !expert_weights) {
+            fprintf(stderr, "one_layer_forward: router alloc failed\n");
+            exit(1);
+        }
         snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_inp.weight", layer_idx);
-        const gguf_tensor_t *rt = gguf_find_tensor(g, nm);
-        if (!rt) { fprintf(stderr, "router tensor not found\n"); exit(1); }
-        const float *router_w = (const float *)
-            (L->pinned_data + L->data_offset + rt->offset);
+        const float *router_w = tensor_ram_f32(L, g, nm);
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_inp_shexp.weight", layer_idx);
+        const half *shared_gate_w = NULL;
+        if (gguf_find_tensor(g, nm)) shared_gate_w = tensor_ram_f16(L, g, nm);
 
         /* Copy d_normed2 → CPU float */
-        float normed_f32[BREAD_HIDDEN_DIM];
+        float *normed_f32 = (float *)malloc(H * sizeof(float));
+        float *logits = (float *)malloc(cfg->num_experts * sizeof(float));
+        if (!normed_f32 || !logits) {
+            fprintf(stderr, "one_layer_forward: router scratch alloc failed\n");
+            exit(1);
+        }
         vram_half_to_cpu_float(d_normed2, normed_f32, H);
 
         /* Dense F32 matmul: logits[i] = router_w[i * H + j] * normed[j] */
-        float logits[BREAD_NUM_EXPERTS];
-        memset(logits, 0, sizeof(logits));
-        for (int i = 0; i < BREAD_NUM_EXPERTS; i++)
+        memset(logits, 0, cfg->num_experts * sizeof(float));
+        for (int i = 0; i < cfg->num_experts; i++)
             for (int j = 0; j < H; j++)
                 logits[i] += router_w[i * H + j] * normed_f32[j];
 
-        cpu_softmax(logits, BREAD_NUM_EXPERTS);
-        cpu_topk(logits, BREAD_NUM_EXPERTS, BREAD_TOP_K,
+        if (shared_gate_w) {
+            for (int j = 0; j < H; j++)
+                shared_gate_score += __half2float(shared_gate_w[j]) * normed_f32[j];
+        }
+
+        cpu_softmax(logits, cfg->num_experts);
+        cpu_topk(logits, cfg->num_experts, cfg->top_k,
                  expert_indices, expert_weights);
+        free(normed_f32);
+        free(logits);
     }
 
     /* ================================================================
      * DMA: Stream B — load K expert weight sets into VRAM
      * ================================================================ */
-    loader_request(L, layer_idx, expert_indices, BREAD_TOP_K);
+    loader_request(L, layer_idx, expert_indices, cfg->top_k);
     loader_sync(L);
 
     /* ================================================================
      * CMD3a: shared expert SwiGLU + down projection → accumulate
      * ================================================================ */
     {
-        int n_blocks_si = (BREAD_SHARED_INTER + 255) / 256;
+        int n_blocks_si = (cfg->shared_inter + 255) / 256;
         silu_mul_inplace<<<n_blocks_si, 256, 0, stream_a>>>(
-            d_sg, d_su, BREAD_SHARED_INTER);
+            d_sg, d_su, cfg->shared_inter);
 
         snprintf(nm, sizeof(nm), "blk.%d.ffn_down_shexp.weight", layer_idx);
         void *d_sd_w = load_vram(L, g, nm);
 
         bread_matvec(d_sd_w, d_sg, d_sh_out,
-                     H, BREAD_SHARED_INTER, GGML_TYPE_Q6_K);
+                     H, cfg->shared_inter, GGML_TYPE_Q6_K);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         cudaFree(d_sd_w);
 
-        int blocks = (H + 255) / 256;
-        scale_accum<<<blocks, 256, 0, stream_a>>>(d_hidden, d_sh_out, 1.0f, H);
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        {
+            float shared_weight = cpu_sigmoid(shared_gate_score);
+            int blocks = (H + 255) / 256;
+            scale_accum<<<blocks, 256, 0, stream_a>>>(d_hidden, d_sh_out, shared_weight, H);
+            CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        }
     }
 
     /* ================================================================
      * CMD3b: K active expert forwards → weighted accumulate into hidden
      * ================================================================ */
     {
-        int n_blocks_ei = (BREAD_EXPERT_INTER + 255) / 256;
+        int n_blocks_ei = (cfg->expert_inter + 255) / 256;
         int n_blocks_h  = (H + 255) / 256;
 
-        for (int k = 0; k < BREAD_TOP_K; k++) {
+        for (int k = 0; k < cfg->top_k; k++) {
             expert_ptrs_t ep = loader_get_expert(L, layer_idx,
                                                   expert_indices[k]);
             if (!ep.gate) {
@@ -680,17 +892,17 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
             /* gate/up projections: normed2[H] → gate/up[EXPERT_INTER] */
             bread_matvec(ep.gate, d_normed2, d_eg,
-                         BREAD_EXPERT_INTER, H, (int)ep.gate_type);
+                         cfg->expert_inter, H, (int)ep.gate_type);
             bread_matvec(ep.up,  d_normed2, d_eu,
-                         BREAD_EXPERT_INTER, H, (int)ep.up_type);
+                         cfg->expert_inter, H, (int)ep.up_type);
 
             /* SwiGLU in-place on gate */
             silu_mul_inplace<<<n_blocks_ei, 256, 0, stream_a>>>(
-                d_eg, d_eu, BREAD_EXPERT_INTER);
+                d_eg, d_eu, cfg->expert_inter);
 
             /* down projection: gate[EXPERT_INTER] → expert_out[H] */
             bread_matvec(ep.down, d_eg, d_eo,
-                         H, BREAD_EXPERT_INTER, (int)ep.down_type);
+                         H, cfg->expert_inter, (int)ep.down_type);
 
             CUDA_CHECK(cudaStreamSynchronize(stream_a));
 
@@ -700,6 +912,8 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             CUDA_CHECK(cudaStreamSynchronize(stream_a));
         }
     }
+    free(expert_indices);
+    free(expert_weights);
     /* d_hidden now contains the full transformer block output */
 }
 
