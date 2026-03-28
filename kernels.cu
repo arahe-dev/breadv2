@@ -27,17 +27,7 @@
 #include <string.h>
 #include <math.h>
 
-/* ------------------------------------------------------------------ */
-/* Error-checking macro — fail loud and early                          */
-/* ------------------------------------------------------------------ */
-#define CUDA_CHECK(call) do {                                          \
-    cudaError_t _err = (call);                                         \
-    if (_err != cudaSuccess) {                                         \
-        fprintf(stderr, "CUDA error %s:%d — %s\n",                    \
-                __FILE__, __LINE__, cudaGetErrorString(_err));         \
-        exit(1);                                                       \
-    }                                                                  \
-} while (0)
+#include "bread_utils.h"
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                            */
@@ -272,25 +262,6 @@ void bread_matvec(void *w, half *x, half *y, int rows, int cols, int qtype)
 /* ================================================================== */
 #ifdef SELFTEST_MAIN
 
-/* ------------------------------------------------------------------ */
-/* CPU reference: fp16 bytes → float32                                 */
-/* ------------------------------------------------------------------ */
-static float fp16_to_fp32_cpu(uint16_t h) {
-    uint32_t sign     = (uint32_t)(h >> 15) << 31;
-    uint32_t exponent = (h >> 10) & 0x1F;
-    uint32_t mantissa = h & 0x03FF;
-    uint32_t bits;
-    if (exponent == 0) {
-        /* zero or subnormal fp16: value = ±mantissa × 2^(-24) */
-        float val = (float)mantissa * (1.0f / 16777216.0f);
-        return (h >> 15) ? -val : val;
-    } else if (exponent == 31) {
-        bits = sign | 0x7F800000u | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
-    }
-    float f; memcpy(&f, &bits, 4); return f;
-}
 
 /* ------------------------------------------------------------------ */
 /* CPU reference get_scale_min_k4 (verbatim from ggml-quants.c)       */
@@ -315,8 +286,8 @@ static void cpu_dequant_q4k(const uint8_t *block, float *out)
     uint16_t d_raw, dmin_raw;
     memcpy(&d_raw,    block + 0, 2);
     memcpy(&dmin_raw, block + 2, 2);
-    float d    = fp16_to_fp32_cpu(d_raw);
-    float dmin = fp16_to_fp32_cpu(dmin_raw);
+    float d    = bread_h2f(d_raw);
+    float dmin = bread_h2f(dmin_raw);
 
     const uint8_t *scales = block + 4;
     const uint8_t *qs     = block + 16;
@@ -345,7 +316,7 @@ static void cpu_dequant_q6k(const uint8_t *block, float *out)
 {
     uint16_t d_raw;
     memcpy(&d_raw, block + 208, 2);
-    float d = fp16_to_fp32_cpu(d_raw);
+    float d = bread_h2f(d_raw);
 
     const uint8_t *ql = block + 0;
     const uint8_t *qh = block + 128;

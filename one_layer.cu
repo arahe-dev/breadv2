@@ -35,19 +35,7 @@
 #include "bread.h"
 #include "gguf.h"
 #include "loader.h"
-
-/* ------------------------------------------------------------------ */
-/* CUDA error check                                                     */
-/* ------------------------------------------------------------------ */
-
-#define CUDA_CHECK(call) do {                                           \
-    cudaError_t _e = (call);                                            \
-    if (_e != cudaSuccess) {                                            \
-        fprintf(stderr, "CUDA error %s:%d — %s\n",                     \
-                __FILE__, __LINE__, cudaGetErrorString(_e));            \
-        exit(1);                                                        \
-    }                                                                   \
-} while (0)
+#include "bread_utils.h"
 
 /* ------------------------------------------------------------------ */
 /* External: bread_matvec from kernels.cu                              */
@@ -109,24 +97,6 @@ static __global__ void silu_mul_inplace(half *gate, const half *up, int n)
     float g = __half2float(gate[i]);
     float u = __half2float(up[i]);
     gate[i] = __float2half(g / (1.0f + expf(-g)) * u);
-}
-
-/* ------------------------------------------------------------------ */
-/* Kernel 3: GQA expand — copy KV-head values to all Q-head slots     */
-/*                                                                      */
-/* For single-token (pos=0) attention the output is just V expanded:  */
-/*   Q-head h gets the value of KV-head  h / (NUM_Q / NUM_KV).       */
-/* Grid: (NUM_Q_HEADS,)   Block: (HEAD_DIM_V,)                        */
-/* ------------------------------------------------------------------ */
-
-static __global__ void gqa_expand_v(half *out, const half *v,
-                               int num_q, int num_kv, int head_dim)
-{
-    int q_head  = blockIdx.x;
-    int kv_head = q_head * num_kv / num_q;
-    int i       = threadIdx.x;
-    if (i < head_dim)
-        out[q_head * head_dim + i] = v[kv_head * head_dim + i];
 }
 
 /* ------------------------------------------------------------------ */
@@ -248,25 +218,6 @@ static void vram_half_to_cpu_float(const half *d_x, float *h_f, int n)
 #define CPU_Q4K_BLOCK_BYTES 144
 #define CPU_Q6K_BLOCK_BYTES 210
 
-static float fp16_to_f32_host(uint16_t h)
-{
-    uint32_t sign     = (uint32_t)(h >> 15) << 31;
-    uint32_t exponent = (h >> 10) & 0x1F;
-    uint32_t mantissa = h & 0x03FF;
-    uint32_t bits;
-    if (exponent == 0) {
-        /* zero or subnormal fp16: value = ±mantissa × 2^(-24) */
-        float val = (float)mantissa * (1.0f / 16777216.0f);
-        return (h >> 15) ? -val : val;
-    } else if (exponent == 31) {
-        bits = sign | 0x7F800000u | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
-    }
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
-}
 
 static void get_scale_min_k4_host(int j, const uint8_t *scales,
                                   uint8_t *d, uint8_t *m)
@@ -288,8 +239,8 @@ static void cpu_dequant_q4k_block(const uint8_t *block, float *out)
     memcpy(&d_raw,    block + 0, 2);
     memcpy(&dmin_raw, block + 2, 2);
     {
-        const float d    = fp16_to_f32_host(d_raw);
-        const float dmin = fp16_to_f32_host(dmin_raw);
+        const float d    = bread_h2f(d_raw);
+        const float dmin = bread_h2f(dmin_raw);
         int is = 0;
         float *y = out;
         const uint8_t *q = qs;
@@ -321,7 +272,7 @@ static void cpu_dequant_q6k_block(const uint8_t *block, float *out)
     const int8_t  *sc = (const int8_t *)(block + 192);
     memcpy(&d_raw, block + 208, 2);
     {
-        const float d = fp16_to_f32_host(d_raw);
+        const float d = bread_h2f(d_raw);
         float *y = out;
         for (int n = 0; n < CPU_QK_BLOCK_ELEMS; n += 128) {
             for (int l = 0; l < 32; ++l) {

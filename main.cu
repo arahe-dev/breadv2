@@ -31,18 +31,7 @@
 #include "gguf.h"
 #include "loader.h"
 #include "tokenizer.h"
-
-/* ------------------------------------------------------------------ */
-/* CUDA error check                                                     */
-/* ------------------------------------------------------------------ */
-#define CUDA_CHECK(call) do {                                           \
-    cudaError_t _e = (call);                                            \
-    if (_e != cudaSuccess) {                                            \
-        fprintf(stderr, "CUDA error %s:%d — %s\n",                     \
-                __FILE__, __LINE__, cudaGetErrorString(_e));            \
-        exit(1);                                                        \
-    }                                                                   \
-} while (0)
+#include "bread_utils.h"
 
 /* ------------------------------------------------------------------ */
 /* Timing (Windows high-resolution)                                     */
@@ -78,26 +67,6 @@ extern void bread_matvec(void *w, half *x, half *y,
 #define QTYPE_Q4_K        12
 #define QTYPE_Q6_K        14
 
-/* ------------------------------------------------------------------ */
-/* Host fp16 → float (needed for Q4K block header decoding)           */
-/* ------------------------------------------------------------------ */
-static float h2f_host(uint16_t h)
-{
-    uint32_t sign     = (uint32_t)(h >> 15) << 31;
-    uint32_t exponent = (h >> 10) & 0x1F;
-    uint32_t mantissa = h & 0x03FF;
-    uint32_t bits;
-    if (exponent == 0) {
-        /* zero or subnormal fp16: value = ±mantissa × 2^(-24) */
-        float val = (float)mantissa * (1.0f / 16777216.0f);
-        return (h >> 15) ? -val : val;
-    } else if (exponent == 31) {
-        bits = sign | 0x7F800000u | (mantissa << 13);
-    } else {
-        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
-    }
-    float f; memcpy(&f, &bits, 4); return f;
-}
 
 /* ------------------------------------------------------------------ */
 /* Q4K row dequant on host → half[]                                    */
@@ -120,8 +89,8 @@ static void dequant_q4k_row(const uint8_t *row_data, half *out_half,
         uint16_t d_raw, dmin_raw;
         memcpy(&d_raw,    blk + 0, 2);
         memcpy(&dmin_raw, blk + 2, 2);
-        float d    = h2f_host(d_raw);
-        float dmin = h2f_host(dmin_raw);
+        float d    = bread_h2f(d_raw);
+        float dmin = bread_h2f(dmin_raw);
 
         /* 4 groups × 64 elements; each group uses 32 qs bytes */
         int is = 0;
