@@ -1,0 +1,81 @@
+loader: initialising...
+gguf: version=3  tensors=1959  kv_pairs=57
+gguf: alignment=32 bytes
+gguf: header parsed in 0.027 s  —  data section at 0xb83a00
+loader: 40 MoE layers found, expert slot size = 2039808 bytes (1.95 MiB)
+loader: allocating 18 VRAM slots × 1.95 MiB = 35.02 MiB
+loader: allocating 23.87 GB host memory...
+loader: reading model...   2.2% (1.43 GB/s)loader: reading model...   4.5% (1.43 GB/s)loader: reading model...   6.7% (1.43 GB/s)loader: reading model...   9.0% (1.43 GB/s)loader: reading model...  11.2% (1.39 GB/s)loader: reading model...  13.5% (1.39 GB/s)loader: reading model...  15.7% (1.37 GB/s)loader: reading model...  18.0% (1.36 GB/s)loader: reading model...  20.2% (1.33 GB/s)loader: reading model...  22.5% (1.32 GB/s)loader: reading model...  24.7% (1.31 GB/s)loader: reading model...  27.0% (1.30 GB/s)loader: reading model...  29.2% (1.30 GB/s)loader: reading model...  31.5% (1.29 GB/s)loader: reading model...  33.7% (1.27 GB/s)loader: reading model...  36.0% (1.25 GB/s)loader: reading model...  38.2% (1.23 GB/s)loader: reading model...  40.5% (1.21 GB/s)loader: reading model...  42.7% (1.18 GB/s)loader: reading model...  45.0% (1.16 GB/s)loader: reading model...  47.2% (1.14 GB/s)loader: reading model...  49.5% (1.12 GB/s)loader: reading model...  51.7% (1.11 GB/s)loader: reading model...  54.0% (1.09 GB/s)loader: reading model...  56.2% (1.07 GB/s)loader: reading model...  58.5% (1.05 GB/s)loader: reading model...  60.7% (1.04 GB/s)loader: reading model...  63.0% (1.03 GB/s)loader: reading model...  65.2% (1.02 GB/s)loader: reading model...  67.5% (1.01 GB/s)loader: reading model...  69.7% (1.00 GB/s)loader: reading model...  72.0% (0.99 GB/s)loader: reading model...  74.2% (0.98 GB/s)loader: reading model...  76.5% (0.98 GB/s)loader: reading model...  78.7% (0.96 GB/s)loader: reading model...  81.0% (0.94 GB/s)loader: reading model...  83.2% (0.87 GB/s)loader: reading model...  85.5% (0.80 GB/s)loader: reading model...  87.7% (0.77 GB/s)loader: reading model...  90.0% (0.73 GB/s)loader: reading model...  92.2% (0.69 GB/s)loader: reading model...  94.5% (0.66 GB/s)loader: reading model...  96.7% (0.64 GB/s)loader: reading model...  99.0% (0.62 GB/s)loader: read 23.87 GB in 40.2 s (0.59 GB/s)            
+loader: ready (host RAM, 18 VRAM slots)
+gguf: version=3  tensors=1959  kv_pairs=57
+gguf: alignment=32 bytes
+gguf: header parsed in 0.044 s  —  data section at 0xb83a00
+tokenizer: vocab=248320 merges=247587 bos=-1 eos=248046 specials=276
+Embed  : rms=0.012976
+TRACE bread.layer0.qkv_proj: n=8192 rms=4.864193 min=-13.994104 max=24.131895 first=0.074292,-1.562783,-0.545480,-0.123492,0.036579,0.579914,1.187189,0.374445
+TRACE bread.layer0.z_proj: n=4096 rms=2.010453 min=-5.466650 max=22.747850 first=-2.301275,-1.761627,-2.069949,-0.355092,-2.341644,-1.018777,-1.843189,-1.189923
+TRACE bread.layer0.alpha_proj: n=32 rms=1.476171 min=-2.299462 max=4.271676 first=-0.244841,1.461009,-0.991226,0.119444,-0.186606,0.470407,1.604000,0.793809
+TRACE bread.layer0.beta_proj: n=32 rms=10.948094 min=-1.275351 max=16.977598 first=13.417880,13.966005,3.231102,9.722584,15.219838,14.609687,12.426889,1.210650
+TRACE bread.layer0.conv_raw: n=8192 rms=0.289645 min=-2.956119 max=5.446655 first=-0.052586,0.081138,0.054990,0.000973,-0.000888,-0.026504,0.052374,0.017691
+TRACE bread.layer0.q_conv_norm_head0: n=128 rms=0.007812 min=-0.051228 max=0.031414 first=-0.004744,0.007823,0.005235,0.000090,-0.000082,-0.002423,0.004980,0.001654
+TRACE bread.layer0.k_conv_norm_head0: n=128 rms=0.088388 min=-0.758822 max=0.247100 first=0.019391,0.121083,-0.008772,-0.032820,-0.034743,0.010175,0.071220,0.144235
+TRACE bread.layer0.v_conv_head0: n=128 rms=0.409634 min=-0.166694 max=4.478073 first=0.015511,-0.053144,-0.033126,-0.001014,0.050439,0.003432,0.071611,-0.144467
+TRACE bread.layer0.vh0.state_before_row0: n=128 rms=0.003629 min=-0.025077 max=0.007143 first=0.002931,0.006447,0.003611,0.000023,0.003552,-0.002426,-0.002491,-0.001636
+TRACE bread.layer0.vh0.q_head: n=128 rms=0.007812 min=-0.051228 max=0.031414 first=-0.004744,0.007823,0.005235,0.000090,-0.000082,-0.002423,0.004980,0.001654
+TRACE bread.layer0.vh0.k_head: n=128 rms=0.088388 min=-0.758822 max=0.247100 first=0.019391,0.121083,-0.008772,-0.032820,-0.034743,0.010175,0.071220,0.144235
+TRACE bread.layer0.vh0.v_head: n=128 rms=0.409634 min=-0.166694 max=4.478073 first=0.015511,-0.053144,-0.033126,-0.001014,0.050439,0.003432,0.071611,-0.144467
+TRACE bread.layer0.vh0.gate: n=1 rms=0.000495 min=-0.000495 max=-0.000495 first=-0.000495
+TRACE bread.layer0.vh0.decay: n=1 rms=0.999505 min=0.999505 max=0.999505 first=0.999505
+TRACE bread.layer0.vh0.beta: n=1 rms=0.999999 min=0.999999 max=0.999999 first=0.999999
+TRACE bread.layer0.vh0.state_after_row0: n=128 rms=0.003548 min=-0.023394 max=0.007359 first=0.002887,0.006177,0.003628,0.000095,0.003627,-0.002447,-0.002647,-0.001952
+TRACE bread.layer0.vh0.readout_pre_norm: n=128 rms=0.009094 min=-0.004265 max=0.099920 first=-0.000397,-0.000927,-0.000949,-0.000054,0.000373,0.000778,0.000970,-0.002907
+TRACE bread.layer0.vh0.readout_post_norm: n=128 rms=0.065187 min=-0.493182 max=0.084198 first=0.007913,0.022679,0.021272,0.000777,-0.007680,-0.020667,-0.024013,0.079747
+Layer  0 [ssm]: hidden_rms=0.435764 branch_rms=0.468743
+Layer  1 [ssm]: hidden_rms=0.639163 branch_rms=0.490767
+Layer  2 [ssm]: hidden_rms=0.652438 branch_rms=0.111887
+TRACE bread.layer3.q_score_head0: n=256 rms=1.264515 min=-4.605143 max=4.756299 first=0.180711,4.669938,2.408126,-3.281956,4.366804,-1.073071,-0.551907,0.194030
+TRACE bread.layer3.k_head0: n=256 rms=1.325238 min=-4.850542 max=4.593190 first=1.689741,-1.271224,-0.302497,-1.755810,0.220078,0.793831,-0.829673,1.670538
+TRACE bread.layer3.q_gate_raw_head0: n=256 rms=1.928102 min=-4.395994 max=2.330900 first=-3.443907,-3.389524,-0.528510,-0.897527,-1.105109,-1.935783,-2.022659,-1.482993
+TRACE bread.layer3.q_gate_sigmoid_head0: n=256 rms=0.267898 min=0.012177 max=0.911404 first=0.030951,0.032624,0.370865,0.289559,0.248784,0.126112,0.116844,0.184976
+TRACE bread.layer3.head0.attn_pre_gate: n=256 rms=0.000000 min=0.000000 max=0.000000 first=0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000
+TRACE bread.layer3.head0.attn_post_gate: n=256 rms=0.000000 min=0.000000 max=0.000000 first=0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000
+TRACE bread.layer3.attn_out_all_heads_post_gate: n=4096 rms=0.000000 min=0.000000 max=0.000000 first=0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000
+TRACE bread.layer3.o_proj_out: n=2048 rms=0.000000 min=0.000000 max=0.000000 first=0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000
+Layer  3 [attn]: hidden_rms=0.657874 branch_rms=0.000000
+Layer  4 [ssm]: hidden_rms=0.653406 branch_rms=0.059960
+Layer  5 [ssm]: hidden_rms=0.646282 branch_rms=0.062788
+Layer  6 [ssm]: hidden_rms=0.652278 branch_rms=0.071439
+Layer  7 [attn]: hidden_rms=0.652876 branch_rms=0.000000
+Layer  8 [ssm]: hidden_rms=0.700920 branch_rms=0.233568
+Layer  9 [ssm]: hidden_rms=0.737446 branch_rms=0.191940
+Layer 10 [ssm]: hidden_rms=0.753040 branch_rms=0.094834
+Layer 11 [attn]: hidden_rms=0.753090 branch_rms=0.000000
+Layer 12 [ssm]: hidden_rms=0.765984 branch_rms=0.091854
+Layer 13 [ssm]: hidden_rms=0.827276 branch_rms=0.309860
+Layer 14 [ssm]: hidden_rms=0.830482 branch_rms=0.042573
+Layer 15 [attn]: hidden_rms=0.830337 branch_rms=0.000000
+Layer 16 [ssm]: hidden_rms=0.828803 branch_rms=0.049900
+Layer 17 [ssm]: hidden_rms=0.824449 branch_rms=0.042331
+Layer 18 [ssm]: hidden_rms=0.819522 branch_rms=0.041298
+Layer 19 [attn]: hidden_rms=0.818860 branch_rms=0.000000
+Layer 20 [ssm]: hidden_rms=0.815004 branch_rms=0.089141
+Layer 21 [ssm]: hidden_rms=0.814553 branch_rms=0.036611
+Layer 22 [ssm]: hidden_rms=0.806276 branch_rms=0.075566
+Layer 23 [attn]: hidden_rms=0.806035 branch_rms=0.000000
+Layer 24 [ssm]: hidden_rms=0.796398 branch_rms=0.047385
+Layer 25 [ssm]: hidden_rms=0.798152 branch_rms=0.067936
+Layer 26 [ssm]: hidden_rms=0.778986 branch_rms=0.071081
+Layer 27 [attn]: hidden_rms=0.778378 branch_rms=0.009727
+Layer 28 [ssm]: hidden_rms=0.775799 branch_rms=0.067597
+Layer 29 [ssm]: hidden_rms=0.773784 branch_rms=0.101756
+Layer 30 [ssm]: hidden_rms=0.777767 branch_rms=0.075046
+Layer 31 [attn]: hidden_rms=0.780582 branch_rms=0.004282
+Layer 32 [ssm]: hidden_rms=0.777524 branch_rms=0.090494
+Layer 33 [ssm]: hidden_rms=0.770477 branch_rms=0.085671
+Layer 34 [ssm]: hidden_rms=0.793346 branch_rms=0.132228
+Layer 35 [attn]: hidden_rms=0.786931 branch_rms=0.038405
+Layer 36 [ssm]: hidden_rms=0.984145 branch_rms=0.524518
+Layer 37 [ssm]: hidden_rms=0.963200 branch_rms=0.165437
+Layer 38 [ssm]: hidden_rms=0.995039 branch_rms=0.209175
+Layer 39 [attn]: hidden_rms=0.998823 branch_rms=0.043997
+Top-5 logits: [212228]=11.21875 [166057]=10.84375 [77513]=10.76562 [221976]=10.64062 [220349]=10.55469

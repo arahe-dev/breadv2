@@ -1,0 +1,6 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8187 MiB):
+  Device 0: NVIDIA GeForce RTX 4060 Laptop GPU, compute capability 8.9, VMM: yes, VRAM: 8187 MiB
+load_backend: loaded CUDA backend from C:\Users\arahe\llama.cpp\build\bin\Release\ggml-cuda.dll
+load_backend: loaded RPC backend from C:\Users\arahe\llama.cpp\build\bin\Release\ggml-rpc.dll
+load_backend: loaded CPU backend from C:\Users\arahe\llama.cpp\build\bin\Release\ggml-cpu-alderlake.dll
+error: invalid argument: -sp

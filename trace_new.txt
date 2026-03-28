@@ -1,0 +1,26 @@
+=== BREAD inference ===
+Prompt   : "The capital of France is"
+MaxTokens: 1
+
+Mode     : minimal-core
+
+Trace    : per-layer hidden RMS + branch RMS + top-5 logits
+
+[1/4] Loading model into pinned RAM (~22 GB)...
+      done in 17.7 s
+
+[2/4] Loading tokenizer...
+      vocab size: 248320
+
+[3/4] Uploading output_norm + lm_head to VRAM...
+      output_norm.weight: 8.0 KB (F32)
+      output.weight:      397.9 MB (type Q6_K)
+
+[4/4] Encoding prompt...
+      17 tokens: [248045 846 198 760 6511 314 9338 369 ...]
+
+--- Prompt prefill (17 tokens) ---
+    prefill: 32203 ms  (1894.3 ms/tok)
+
+--- Generated output ---
+The
