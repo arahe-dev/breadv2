@@ -62,6 +62,8 @@ static double now_ms(void) {
 extern void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                                loader_t *L, gguf_ctx_t *g,
                                cudaStream_t stream_a);
+extern float one_layer_cpu_hidden_rms(int hidden_dim);
+extern float one_layer_last_branch_rms(void);
 
 /* kernels.cu */
 extern void bread_matvec(void *w, half *x, half *y,
@@ -211,6 +213,26 @@ static __global__ void f16_matvec(const half *w, const half *x,
 /* ================================================================== */
 
 /* ------------------------------------------------------------------ */
+/* compute_rms_host: compute RMS norm of half tensor (on host)        */
+/* ================================================================== */
+static float compute_rms_host(const half *d_tensor, int n,
+                              half *h_buf, cudaStream_t stream)
+{
+    /* Copy to host */
+    CUDA_CHECK(cudaMemcpyAsync(h_buf, d_tensor, (size_t)n * sizeof(half),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    /* Compute RMS on host */
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float f = __half2float(h_buf[i]);
+        sum += f * f;
+    }
+    return sqrtf(sum / n);
+}
+
+/* ------------------------------------------------------------------ */
 /* embed_token: copy one token's embedding row to d_hidden (VRAM)     */
 /*                                                                      */
 /* Supports Q4_K (primary) and F16 (fallback) embedding types.       */
@@ -243,6 +265,28 @@ static void embed_token(int32_t token_id,
     CUDA_CHECK(cudaMemcpy(d_hidden, h_emb_row,
                            cfg->hidden_dim * sizeof(half),
                            cudaMemcpyHostToDevice));
+}
+
+static char *format_prompt_for_model(const tokenizer_t *tok, const char *prompt)
+{
+    const char *pre = tokenizer_pre(tok);
+    size_t n;
+    char *wrapped;
+
+    if (!pre || strcmp(pre, "qwen35") != 0) {
+        return _strdup(prompt);
+    }
+    if (strncmp(prompt, "<|im_start|>", 12) == 0) {
+        return _strdup(prompt);
+    }
+
+    n = strlen(prompt) + 128;
+    wrapped = (char *)malloc(n);
+    if (!wrapped) return NULL;
+    snprintf(wrapped, n,
+             "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+             prompt);
+    return wrapped;
 }
 
 /* ------------------------------------------------------------------ */
@@ -307,6 +351,33 @@ static int32_t greedy_sample(const half *d_logits, half *h_logits)
     return best_id;
 }
 
+static void print_top5_logits(const half *h_logits, int vocab_size)
+{
+    int ids[5] = {0, 0, 0, 0, 0};
+    float vals[5] = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
+
+    for (int i = 0; i < vocab_size; i++) {
+        float v = __half2float(h_logits[i]);
+        for (int k = 0; k < 5; k++) {
+            if (v > vals[k]) {
+                for (int s = 4; s > k; s--) {
+                    vals[s] = vals[s - 1];
+                    ids[s] = ids[s - 1];
+                }
+                vals[k] = v;
+                ids[k] = i;
+                break;
+            }
+        }
+    }
+
+    fprintf(stderr, "Top-5 logits:");
+    for (int k = 0; k < 5; k++) {
+        fprintf(stderr, " [%d]=%.5f", ids[k], vals[k]);
+    }
+    fprintf(stderr, "\n");
+}
+
 /* ================================================================== */
 /*  main                                                                */
 /* ================================================================== */
@@ -316,17 +387,37 @@ int main(int argc, char **argv)
     const char *model_path = BREAD_MODEL_PATH;
     const char *prompt     = "Hello, I am";
     int         max_tokens = 50;
+    int         minimal_mode = 0;
+    int         debug_rms   = 0;
+    int         force_ssm_zero = 0;
+    int         disable_rope = 0;
 
     /* -- Parse args ------------------------------------------------- */
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--prompt") && i+1 < argc) prompt     = argv[++i];
         else if (!strcmp(argv[i], "--tokens") && i+1 < argc) max_tokens = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--model")  && i+1 < argc) model_path = argv[++i];
+        else if (!strcmp(argv[i], "--minimal")) minimal_mode = 1;
+        else if (!strcmp(argv[i], "--boring"))  minimal_mode = 1;
+        else if (!strcmp(argv[i], "--debug"))   debug_rms = 1;
+        else if (!strcmp(argv[i], "--force-ssm-zero")) force_ssm_zero = 1;
+        else if (!strcmp(argv[i], "--disable-rope"))   disable_rope = 1;
     }
+
+    bread_set_boring_mode(minimal_mode);
+    bread_set_force_ssm_zero(force_ssm_zero);
+    bread_set_disable_rope(disable_rope);
+    bread_set_trace_debug(debug_rms);
+    bread_set_trace_pos(-1);
 
     printf("=== BREAD inference ===\n");
     printf("Prompt   : \"%s\"\n", prompt);
     printf("MaxTokens: %d\n\n", max_tokens);
+    printf("Mode     : %s\n\n", minimal_mode ? "minimal-core" : "orchestrated");
+    if (force_ssm_zero) printf("Experiment: force SSM branch output to zero\n");
+    if (disable_rope)   printf("Experiment: disable RoPE\n");
+    if (debug_rms)      printf("Trace    : per-layer hidden RMS + branch RMS + top-5 logits\n");
+    if (force_ssm_zero || disable_rope || debug_rms) printf("\n");
 
     /* -- Load model into pinned RAM --------------------------------- */
     printf("[1/4] Loading model into pinned RAM (~22 GB)...\n");
@@ -384,18 +475,22 @@ int main(int argc, char **argv)
     int32_t token_buf[4096];
     int32_t bos = tokenizer_bos(tok);
     int n_prompt;
+    char *model_prompt = format_prompt_for_model(tok, prompt);
+    if (!model_prompt) { fprintf(stderr, "prompt formatting failed\n"); return 1; }
     if (bos >= 0) {
         token_buf[0] = bos;
-        n_prompt = 1 + tokenizer_encode(tok, prompt, token_buf + 1, 4095);
+        n_prompt = 1 + tokenizer_encode(tok, model_prompt, token_buf + 1, 4095);
     } else {
         /* No BOS token for this model (Qwen3.5 style) — encode prompt directly */
-        n_prompt = tokenizer_encode(tok, prompt, token_buf, 4096);
+        n_prompt = tokenizer_encode(tok, model_prompt, token_buf, 4096);
     }
     printf("      %d tokens: [", n_prompt);
     for (int i = 0; i < n_prompt && i < 8; i++)
         printf("%s%d", i ? " " : "", token_buf[i]);
     if (n_prompt > 8) printf(" ...");
     printf("]\n\n");
+    if (debug_rms && n_prompt > 0) bread_set_trace_pos(n_prompt - 1);
+    free(model_prompt);
 
     /* -- CUDA resources --------------------------------------------- */
     cudaStream_t stream_a;
@@ -425,8 +520,25 @@ int main(int argc, char **argv)
 
     for (int p = 0; p < n_prompt; p++) {
         embed_token(token_buf[p], cfg, L, g, d_hidden, h_emb_row);
+
+        if (debug_rms && p == n_prompt - 1) {
+            float rms = compute_rms_host(d_hidden, cfg->hidden_dim, h_emb_row, stream_a);
+            fprintf(stderr, "Embed  : rms=%f\n", rms);
+        }
         for (int layer = 0; layer < cfg->num_layers; layer++)
+        {
             one_layer_forward(d_hidden, layer, p, L, g, stream_a);
+            if (debug_rms && p == n_prompt - 1) {
+                float hidden_rms = minimal_mode
+                    ? one_layer_cpu_hidden_rms(cfg->hidden_dim)
+                    : compute_rms_host(d_hidden, cfg->hidden_dim, h_emb_row, stream_a);
+                float branch_rms = one_layer_last_branch_rms();
+                fprintf(stderr, "Layer %2d [%s]: hidden_rms=%f branch_rms=%f\n",
+                        layer,
+                        bread_layer_is_full_attention(layer) ? "attn" : "ssm",
+                        hidden_rms, branch_rms);
+            }
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
@@ -443,6 +555,9 @@ int main(int argc, char **argv)
     apply_output_norm(cfg, d_hidden, d_norm_w, stream_a);
     compute_logits(cfg, d_hidden, d_output_w, out_t->type, d_logits, stream_a);
     int32_t next_tok = greedy_sample(d_logits, h_logits);
+    if (debug_rms) {
+        print_top5_logits(h_logits, cfg->vocab_size);
+    }
 
     double t_ttft_done = now_ms();
     double ttft_ms = t_ttft_done - t_ttft_start;
@@ -466,8 +581,9 @@ int main(int argc, char **argv)
     while (n_gen < max_tokens && next_tok != eos) {
         embed_token(next_tok, cfg, L, g, d_hidden, h_emb_row);
 
-        for (int layer = 0; layer < cfg->num_layers; layer++)
+        for (int layer = 0; layer < cfg->num_layers; layer++) {
             one_layer_forward(d_hidden, layer, n_prompt + n_gen, L, g, stream_a);
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
 
         apply_output_norm(cfg, d_hidden, d_norm_w, stream_a);

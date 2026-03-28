@@ -37,11 +37,9 @@
 #define BREAD_Q_PROJ_DIM      8192     /* Q projection output: 16 × 512        */
 #define BREAD_KV_PROJ_DIM     512      /* K or V projection output: 2 × 256    */
 #define BREAD_ATTN_OUT_DIM    4096     /* o_proj input: 16 × 256               */
-#define BREAD_HEAD_DIM_ROPE   128      /* rotary dims per head (partial RoPE)  */
+#define BREAD_HEAD_DIM_ROPE   64       /* rotary dims per head (Qwen35MoE)     */
 #define BREAD_KV_CACHE_LEN    8192     /* host KV cache capacity per FA layer  */
-
-/* True for full-attention layers, false for SSM/GatedDeltaNet        */
-#define BREAD_IS_FULL_ATTN(layer)  (((layer) % 4) == 3)
+#define BREAD_FULL_ATTN_INTERVAL 4     /* every 4th layer is full attention    */
 
 /* ------------------------------------------------------------------ */
 /* GatedDeltaNet / SSM                                                 */
@@ -93,6 +91,8 @@ typedef struct {
     int attn_out_dim;
     int head_dim_rope;
     int kv_cache_len;
+    int full_attention_interval;
+    int rope_sections[4];
 
     int ssm_num_k_heads;
     int ssm_num_v_heads;
@@ -100,6 +100,12 @@ typedef struct {
     int ssm_qkv_dim;
     int ssm_z_dim;
     int ssm_conv_kernel;
+    int ssm_inner_size;
+    int ssm_state_size;
+    int ssm_time_step_rank;
+    int ssm_group_count;
+    int ssm_v_head_reordered;
+    int rope_mrope_interleaved;
 
     int expert_inter;
     int shared_inter;
@@ -116,6 +122,18 @@ extern "C" {
 
 int bread_model_config_init(const char *model_path, const gguf_ctx_t *g);
 const bread_model_config_t *bread_model_config_get(void);
+int bread_layer_is_recurrent(int layer_idx);
+int bread_layer_is_full_attention(int layer_idx);
+void bread_set_boring_mode(int enabled);
+int bread_get_boring_mode(void);
+void bread_set_force_ssm_zero(int enabled);
+int bread_get_force_ssm_zero(void);
+void bread_set_disable_rope(int enabled);
+int bread_get_disable_rope(void);
+void bread_set_trace_debug(int enabled);
+int bread_get_trace_debug(void);
+void bread_set_trace_pos(int pos);
+int bread_get_trace_pos(void);
 
 #ifdef __cplusplus
 }

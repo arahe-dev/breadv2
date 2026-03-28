@@ -39,6 +39,9 @@ int32_t tokenizer_eos(const tokenizer_t *tok);
 /* Vocabulary size. */
 int32_t tokenizer_vocab_size(const tokenizer_t *tok);
 
+/* tokenizer.ggml.pre metadata, if present (e.g. "qwen35"). */
+const char *tokenizer_pre(const tokenizer_t *tok);
+
 /* Run self-test: encode "Hello", print IDs, decode back, verify round-trip.
  * Returns 0 on success, 1 on failure. */
 int tokenizer_selftest(const char *model_path);

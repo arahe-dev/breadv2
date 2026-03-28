@@ -285,11 +285,20 @@ struct tokenizer_t {
     int32_t   vocab_size;
     int32_t   bos_id;
     int32_t   eos_id;
+    char     *pre_name;
     hmap_t   *tok_to_id;   /* token string → id */
     hmap_t   *merge_rank;  /* "A B" → merge rank (array index) */
     int32_t   num_merges;
+    char    **special_texts;
+    int32_t  *special_ids;
+    int32_t   num_specials;
+    int32_t   max_special_len;
     uint8_t   missing[68]; /* GPT-2 extra byte table */
 };
+
+static int looks_like_special_token(const char *s);
+static int match_special_token(const tokenizer_t *tok, const uint8_t *data, int n,
+                               int32_t *out_id);
 
 /* ------------------------------------------------------------------ */
 /* Load tokenizer from GGUF file                                       */
@@ -382,6 +391,10 @@ tokenizer_t *tokenizer_load(const char *model_path) {
             else if (vtype == 5) tok->eos_id = r_i32(fp);
             else                 skip_val(fp, vtype);
             handled = 1;
+        } else if (strcmp(key, "tokenizer.ggml.pre") == 0) {
+            if (vtype == 8) tok->pre_name = read_str(fp);
+            else            skip_val(fp, vtype);
+            handled = 1;
         }
 
         if (!handled) skip_val(fp, vtype);
@@ -403,6 +416,23 @@ tokenizer_t *tokenizer_load(const char *model_path) {
     for (int32_t i = 0; i < n_tokens; i++)
         hm_put(tok->tok_to_id, tokens[i], i);
 
+    tok->special_texts = (char **)malloc((size_t)n_tokens * sizeof(char *));
+    tok->special_ids   = (int32_t *)malloc((size_t)n_tokens * sizeof(int32_t));
+    if (!tok->special_texts || !tok->special_ids) tok_fatal("OOM allocating special token tables");
+    tok->num_specials = 0;
+    tok->max_special_len = 0;
+    for (int32_t i = 0; i < n_tokens; i++) {
+        if (looks_like_special_token(tokens[i])) {
+            tok->special_texts[tok->num_specials] = tokens[i];
+            tok->special_ids[tok->num_specials] = i;
+            tok->num_specials++;
+            {
+                int len = (int)strlen(tokens[i]);
+                if (len > tok->max_special_len) tok->max_special_len = len;
+            }
+        }
+    }
+
     /* --- Build merge rank table --- */
     tok->num_merges = n_merges;
     if (merges && n_merges > 0) {
@@ -414,8 +444,8 @@ tokenizer_t *tokenizer_load(const char *model_path) {
         free(merges);
     }
 
-    fprintf(stderr, "tokenizer: vocab=%d merges=%d bos=%d eos=%d\n",
-            tok->vocab_size, tok->num_merges, tok->bos_id, tok->eos_id);
+    fprintf(stderr, "tokenizer: vocab=%d merges=%d bos=%d eos=%d specials=%d\n",
+            tok->vocab_size, tok->num_merges, tok->bos_id, tok->eos_id, tok->num_specials);
     return tok;
 }
 
@@ -426,12 +456,16 @@ void tokenizer_free(tokenizer_t *tok) {
     free(tok->id_to_tok);
     if (tok->tok_to_id)   hm_free(tok->tok_to_id);
     if (tok->merge_rank)  hm_free(tok->merge_rank);
+    free(tok->special_texts);
+    free(tok->special_ids);
+    if (tok->pre_name)    free(tok->pre_name);
     free(tok);
 }
 
 int32_t tokenizer_bos(const tokenizer_t *tok)        { return tok->bos_id; }
 int32_t tokenizer_eos(const tokenizer_t *tok)        { return tok->eos_id; }
 int32_t tokenizer_vocab_size(const tokenizer_t *tok) { return tok->vocab_size; }
+const char *tokenizer_pre(const tokenizer_t *tok)    { return tok->pre_name ? tok->pre_name : ""; }
 
 /* ------------------------------------------------------------------ */
 /* BPE encode                                                           */
@@ -540,17 +574,136 @@ static int bpe_merge_and_lookup(const tokenizer_t *tok,
     return written;
 }
 
+static int is_ascii_space(uint8_t c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+}
+
+static int is_ascii_alpha(uint8_t c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static int is_ascii_digit(uint8_t c) {
+    return (c >= '0' && c <= '9');
+}
+
+static int looks_like_special_token(const char *s) {
+    size_t n = strlen(s);
+    if (n < 3) return 0;
+    if (s[0] != '<' || s[n - 1] != '>') return 0;
+    for (size_t i = 1; i + 1 < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c > 0x7E) return 0;
+    }
+    return 1;
+}
+
+static int match_special_token(const tokenizer_t *tok, const uint8_t *data, int n,
+                               int32_t *out_id) {
+    int best_len = 0;
+    int32_t best_id = -1;
+    for (int i = 0; i < tok->num_specials; i++) {
+        const char *sp = tok->special_texts[i];
+        int len = (int)strlen(sp);
+        if (len <= best_len || len > n) continue;
+        if (memcmp(data, sp, (size_t)len) == 0) {
+            best_len = len;
+            best_id = tok->special_ids[i];
+        }
+    }
+    if (best_len > 0 && out_id) *out_id = best_id;
+    return best_len;
+}
+
+static int match_ascii_contraction(const uint8_t *data, int n, int i) {
+    static const char *suffixes[] = { "'s", "'t", "'re", "'ve", "'m", "'ll", "'d" };
+    if (i >= n || data[i] != '\'') return 0;
+    for (int k = 0; k < (int)(sizeof(suffixes) / sizeof(suffixes[0])); k++) {
+        int len = (int)strlen(suffixes[k]);
+        if (i + len <= n && memcmp(data + i, suffixes[k], (size_t)len) == 0) return len;
+    }
+    return 0;
+}
+
+static int encode_piece_bytes(const tokenizer_t *tok, const uint8_t *data, int n,
+                              int32_t *out, int max_out) {
+    char **pieces;
+    int n_sym;
+    int total;
+    if (n <= 0 || max_out <= 0) return 0;
+    pieces = bytes_to_pieces(data, n, tok->missing);
+    n_sym  = n;
+    total  = bpe_merge_and_lookup(tok, pieces, &n_sym, out, max_out);
+    free(pieces);
+    return total;
+}
+
 int tokenizer_encode(const tokenizer_t *tok, const char *text,
                      int32_t *out, int max_out) {
     int n = (int)strlen(text);
+    int i = 0;
+    int total = 0;
+    const uint8_t *data = (const uint8_t *)text;
+
     if (n <= 0 || max_out <= 0) return 0;
 
-    const uint8_t *data   = (const uint8_t *)text;
-    char         **pieces = bytes_to_pieces(data, n, tok->missing);
-    int            n_sym  = n;
+    while (i < n && total < max_out) {
+        int start = i;
+        int len = 0;
+        int c_len;
+        int32_t special_id = -1;
 
-    int total = bpe_merge_and_lookup(tok, pieces, &n_sym, out, max_out);
-    free(pieces); /* individual strings freed inside bpe_merge_and_lookup */
+        c_len = match_special_token(tok, data + i, n - i, &special_id);
+        if (c_len > 0) {
+            out[total++] = special_id;
+            i += c_len;
+            continue;
+        }
+
+        if (is_ascii_space(data[i])) {
+            if (i + 1 < n && !is_ascii_space(data[i + 1])) {
+                i++;
+                c_len = match_ascii_contraction(data, n, i);
+                if (c_len > 0) {
+                    i += c_len;
+                } else if (is_ascii_alpha(data[i])) {
+                    while (i < n && is_ascii_alpha(data[i])) i++;
+                } else if (is_ascii_digit(data[i])) {
+                    while (i < n && is_ascii_digit(data[i])) i++;
+                } else {
+                    while (i < n && !is_ascii_space(data[i]) &&
+                           !is_ascii_alpha(data[i]) && !is_ascii_digit(data[i]) &&
+                           match_ascii_contraction(data, n, i) == 0) {
+                        i++;
+                    }
+                }
+            } else {
+                while (i < n && is_ascii_space(data[i])) i++;
+            }
+        } else {
+            c_len = match_ascii_contraction(data, n, i);
+            if (c_len > 0) {
+                i += c_len;
+            } else if (is_ascii_alpha(data[i])) {
+                while (i < n && is_ascii_alpha(data[i])) i++;
+            } else if (is_ascii_digit(data[i])) {
+                while (i < n && is_ascii_digit(data[i])) i++;
+            } else {
+                while (i < n && !is_ascii_space(data[i]) &&
+                       !is_ascii_alpha(data[i]) && !is_ascii_digit(data[i]) &&
+                       match_ascii_contraction(data, n, i) == 0) {
+                    i++;
+                }
+            }
+        }
+
+        len = i - start;
+        if (len > 0) {
+            total += encode_piece_bytes(tok, data + start, len, out + total, max_out - total);
+        } else {
+            i++;
+        }
+    }
+
     return total;
 }
 

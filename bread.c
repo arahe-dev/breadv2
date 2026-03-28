@@ -17,6 +17,11 @@
 
 static bread_model_config_t g_cfg;
 static int g_cfg_ready = 0;
+static int g_boring_mode = 0;
+static int g_force_ssm_zero = 0;
+static int g_disable_rope = 0;
+static int g_trace_debug = 0;
+static int g_trace_pos = -1;
 
 static void xread(FILE *fp, void *buf, size_t n) {
     if (fread(buf, 1, n, fp) != n) {
@@ -45,6 +50,25 @@ static void skip_bytes(FILE *fp, uint64_t n) {
 
 static void skip_str(FILE *fp) {
     skip_bytes(fp, r_u64(fp));
+}
+
+static void skip_val(FILE *fp, uint32_t vt);
+
+static void read_u32_array(FILE *fp, int *dst, int max_count, int *out_count) {
+    uint32_t et = r_u32(fp);
+    uint64_t cnt = r_u64(fp);
+    int n = 0;
+
+    if (et == 4) {
+        for (uint64_t i = 0; i < cnt; i++) {
+            uint32_t v = r_u32(fp);
+            if (n < max_count) dst[n++] = (int)v;
+        }
+    } else {
+        for (uint64_t i = 0; i < cnt; i++) skip_val(fp, et);
+    }
+
+    if (out_count) *out_count = n;
 }
 
 static void skip_val(FILE *fp, uint32_t vt) {
@@ -86,12 +110,20 @@ static void bread_cfg_defaults(bread_model_config_t *cfg) {
     cfg->attn_out_dim = BREAD_ATTN_OUT_DIM;
     cfg->head_dim_rope = BREAD_HEAD_DIM_ROPE;
     cfg->kv_cache_len = BREAD_KV_CACHE_LEN;
+    cfg->full_attention_interval = BREAD_FULL_ATTN_INTERVAL;
+    memset(cfg->rope_sections, 0, sizeof(cfg->rope_sections));
     cfg->ssm_num_k_heads = BREAD_SSM_NUM_K_HEADS;
     cfg->ssm_num_v_heads = BREAD_SSM_NUM_V_HEADS;
     cfg->ssm_head_dim = BREAD_SSM_HEAD_DIM;
     cfg->ssm_qkv_dim = BREAD_SSM_QKV_DIM;
     cfg->ssm_z_dim = BREAD_SSM_Z_DIM;
     cfg->ssm_conv_kernel = BREAD_SSM_CONV_KERNEL;
+    cfg->ssm_inner_size = BREAD_SSM_Z_DIM;
+    cfg->ssm_state_size = BREAD_SSM_HEAD_DIM;
+    cfg->ssm_time_step_rank = BREAD_SSM_NUM_V_HEADS;
+    cfg->ssm_group_count = BREAD_SSM_NUM_K_HEADS;
+    cfg->ssm_v_head_reordered = 0;
+    cfg->rope_mrope_interleaved = 0;
     cfg->expert_inter = BREAD_EXPERT_INTER;
     cfg->shared_inter = BREAD_SHARED_INTER;
     cfg->num_experts = BREAD_NUM_EXPERTS;
@@ -120,15 +152,16 @@ static void bread_cfg_from_metadata(const char *model_path, bread_model_config_t
         } else if (!strcmp(key, "qwen35moe.attention.head_count") && vt == 4) {
             cfg->num_q_heads = (int)r_u32(fp);
         } else if (!strcmp(key, "qwen35moe.attention.head_count_kv") && vt == 9) {
-            uint32_t et = r_u32(fp);
-            uint64_t cnt = r_u64(fp);
-            if (et == 4 && cnt > 0) cfg->num_kv_heads = (int)r_u32(fp);
-            for (uint64_t j = 1; et == 4 && j < cnt; j++) (void)r_u32(fp);
-            if (et != 4) for (uint64_t j = 0; j < cnt; j++) skip_val(fp, et);
+            int kv_arr[BREAD_NUM_LAYERS];
+            int n_kv = 0;
+            read_u32_array(fp, kv_arr, BREAD_NUM_LAYERS, &n_kv);
+            if (n_kv > 0) cfg->num_kv_heads = kv_arr[0];
         } else if (!strcmp(key, "qwen35moe.attention.key_length") && vt == 4) {
             cfg->head_dim_qk = (int)r_u32(fp);
         } else if (!strcmp(key, "qwen35moe.attention.value_length") && vt == 4) {
             cfg->head_dim_v = (int)r_u32(fp);
+        } else if (!strcmp(key, "qwen35moe.full_attention_interval") && vt == 4) {
+            cfg->full_attention_interval = (int)r_u32(fp);
         } else if (!strcmp(key, "qwen35moe.expert_feed_forward_length") && vt == 4) {
             cfg->expert_inter = (int)r_u32(fp);
         } else if (!strcmp(key, "qwen35moe.expert_shared_feed_forward_length") && vt == 4) {
@@ -137,10 +170,30 @@ static void bread_cfg_from_metadata(const char *model_path, bread_model_config_t
             cfg->num_experts = (int)r_u32(fp);
         } else if (!strcmp(key, "qwen35moe.expert_used_count") && vt == 4) {
             cfg->top_k = (int)r_u32(fp);
+        } else if (!strcmp(key, "qwen35moe.rope.dimension_count") && vt == 4) {
+            cfg->head_dim_rope = (int)r_u32(fp);
+        } else if (!strcmp(key, "qwen35moe.rope.dimension_sections") && vt == 9) {
+            int n_sec = 0;
+            read_u32_array(fp, cfg->rope_sections, 4, &n_sec);
+            (void)n_sec;
         } else if (!strcmp(key, "qwen35moe.attention.layer_norm_rms_epsilon") && vt == 6) {
             cfg->rms_eps = r_f32(fp);
         } else if (!strcmp(key, "qwen35moe.rope.freq_base") && vt == 6) {
             cfg->rope_freq_base = r_f32(fp);
+        } else if (!strcmp(key, "qwen35moe.ssm.conv_kernel") && vt == 4) {
+            cfg->ssm_conv_kernel = (int)r_u32(fp);
+        } else if (!strcmp(key, "qwen35moe.ssm.inner_size") && vt == 4) {
+            cfg->ssm_inner_size = (int)r_u32(fp);
+        } else if (!strcmp(key, "qwen35moe.ssm.state_size") && vt == 4) {
+            cfg->ssm_state_size = (int)r_u32(fp);
+        } else if (!strcmp(key, "qwen35moe.ssm.time_step_rank") && vt == 4) {
+            cfg->ssm_time_step_rank = (int)r_u32(fp);
+        } else if (!strcmp(key, "qwen35moe.ssm.group_count") && vt == 4) {
+            cfg->ssm_group_count = (int)r_u32(fp);
+        } else if (!strcmp(key, "qwen35moe.ssm.v_head_reordered") && vt == 7) {
+            cfg->ssm_v_head_reordered = (int)r_u8(fp);
+        } else if (!strcmp(key, "qwen35moe.rope.mrope_interleaved") && vt == 7) {
+            cfg->rope_mrope_interleaved = (int)r_u8(fp);
         } else {
             skip_val(fp, vt);
         }
@@ -171,6 +224,14 @@ int bread_model_config_init(const char *model_path, const gguf_ctx_t *g)
     }
     if (layer > 0) g_cfg.num_layers = layer;
 
+    if (g_cfg.ssm_state_size > 0) g_cfg.ssm_head_dim = g_cfg.ssm_state_size;
+    if (g_cfg.ssm_group_count > 0) g_cfg.ssm_num_k_heads = g_cfg.ssm_group_count;
+    if (g_cfg.ssm_time_step_rank > 0) g_cfg.ssm_num_v_heads = g_cfg.ssm_time_step_rank;
+    if (g_cfg.ssm_inner_size > 0) g_cfg.ssm_z_dim = g_cfg.ssm_inner_size;
+    if (g_cfg.ssm_num_k_heads > 0 && g_cfg.ssm_head_dim > 0 && g_cfg.ssm_z_dim > 0) {
+        g_cfg.ssm_qkv_dim = g_cfg.ssm_z_dim + 2 * g_cfg.ssm_num_k_heads * g_cfg.ssm_head_dim;
+    }
+
     for (layer = 0; layer < g_cfg.num_layers; layer++) {
         char nm[64];
         snprintf(nm, sizeof(nm), "blk.%d.attn_q.weight", layer);
@@ -188,15 +249,22 @@ int bread_model_config_init(const char *model_path, const gguf_ctx_t *g)
             snprintf(nm, sizeof(nm), "blk.%d.attn_k_norm.weight", layer);
             t_kn = gguf_find_tensor(g, nm);
             if (t->n_dims >= 2 && t_k && t_v && t_o && t_qn && t_kn) {
-                g_cfg.q_proj_dim = (int)t->dims[1];
-                g_cfg.kv_proj_dim = (int)t_k->dims[1];
-                g_cfg.attn_out_dim = (int)t_o->dims[0];
-                g_cfg.head_dim_qk = (int)t_qn->dims[0];
-                g_cfg.num_kv_heads = g_cfg.kv_proj_dim / g_cfg.head_dim_qk;
-                g_cfg.head_dim_v = g_cfg.kv_proj_dim / g_cfg.num_kv_heads;
-                g_cfg.num_q_heads = g_cfg.attn_out_dim / g_cfg.head_dim_v;
-                g_cfg.head_dim_qgate = g_cfg.q_proj_dim / g_cfg.num_q_heads - g_cfg.head_dim_qk;
-                g_cfg.head_dim_rope = g_cfg.head_dim_qk / 2;
+                const int q_proj_dim = (int)t->dims[1];
+                const int kv_proj_dim = (int)t_k->dims[1];
+                const int attn_out_dim = (int)t_o->dims[0];
+                const int head_dim_qk = (int)t_qn->dims[0];
+                const int num_kv_heads = kv_proj_dim / head_dim_qk;
+                const int head_dim_v = kv_proj_dim / num_kv_heads;
+                const int num_q_heads = attn_out_dim / head_dim_v;
+
+                g_cfg.q_proj_dim = q_proj_dim;
+                g_cfg.kv_proj_dim = kv_proj_dim;
+                g_cfg.attn_out_dim = attn_out_dim;
+                g_cfg.head_dim_qk = head_dim_qk;
+                g_cfg.num_kv_heads = num_kv_heads;
+                g_cfg.head_dim_v = head_dim_v;
+                g_cfg.num_q_heads = num_q_heads;
+                g_cfg.head_dim_qgate = q_proj_dim / num_q_heads - head_dim_qk;
                 break;
             }
         }
@@ -217,17 +285,20 @@ int bread_model_config_init(const char *model_path, const gguf_ctx_t *g)
         snprintf(nm, sizeof(nm), "blk.%d.ssm_norm.weight", layer);
         t_norm = gguf_find_tensor(g, nm);
         if (t && t_gate && t_conv && t_norm) {
-            g_cfg.ssm_qkv_dim = (int)t->dims[1];
-            g_cfg.ssm_z_dim = (int)t_gate->dims[1];
-            g_cfg.ssm_num_v_heads = (int)t_alpha->dims[1];
-            g_cfg.ssm_head_dim = (int)t_norm->dims[0];
-            g_cfg.ssm_num_k_heads =
-                (g_cfg.ssm_qkv_dim - g_cfg.ssm_z_dim) / (2 * g_cfg.ssm_head_dim);
-            g_cfg.ssm_conv_kernel = (int)t_conv->dims[0];
+            if (g_cfg.ssm_qkv_dim <= 0) g_cfg.ssm_qkv_dim = (int)t->dims[1];
+            if (g_cfg.ssm_z_dim <= 0) g_cfg.ssm_z_dim = (int)t_gate->dims[1];
+            if (g_cfg.ssm_num_v_heads <= 0) g_cfg.ssm_num_v_heads = (int)t_alpha->dims[1];
+            if (g_cfg.ssm_head_dim <= 0) g_cfg.ssm_head_dim = (int)t_norm->dims[0];
+            if (g_cfg.ssm_num_k_heads <= 0) {
+                g_cfg.ssm_num_k_heads =
+                    (g_cfg.ssm_qkv_dim - g_cfg.ssm_z_dim) / (2 * g_cfg.ssm_head_dim);
+            }
+            if (g_cfg.ssm_conv_kernel <= 0) g_cfg.ssm_conv_kernel = (int)t_conv->dims[0];
             break;
         }
     }
 
+    if (g_cfg.full_attention_interval <= 0) g_cfg.full_attention_interval = BREAD_FULL_ATTN_INTERVAL;
     if (g_cfg.kv_cache_len <= 0) g_cfg.kv_cache_len = BREAD_KV_CACHE_LEN;
     if (g_cfg.top_k <= 0) g_cfg.top_k = BREAD_TOP_K;
 
@@ -238,4 +309,66 @@ int bread_model_config_init(const char *model_path, const gguf_ctx_t *g)
 const bread_model_config_t *bread_model_config_get(void)
 {
     return g_cfg_ready ? &g_cfg : NULL;
+}
+
+int bread_layer_is_recurrent(int layer_idx)
+{
+    const bread_model_config_t *cfg = bread_model_config_get();
+    int interval = cfg ? cfg->full_attention_interval : BREAD_FULL_ATTN_INTERVAL;
+    return ((layer_idx + 1) % interval) != 0;
+}
+
+int bread_layer_is_full_attention(int layer_idx)
+{
+    return !bread_layer_is_recurrent(layer_idx);
+}
+
+void bread_set_boring_mode(int enabled)
+{
+    g_boring_mode = enabled ? 1 : 0;
+}
+
+int bread_get_boring_mode(void)
+{
+    return g_boring_mode;
+}
+
+void bread_set_force_ssm_zero(int enabled)
+{
+    g_force_ssm_zero = enabled ? 1 : 0;
+}
+
+int bread_get_force_ssm_zero(void)
+{
+    return g_force_ssm_zero;
+}
+
+void bread_set_disable_rope(int enabled)
+{
+    g_disable_rope = enabled ? 1 : 0;
+}
+
+int bread_get_disable_rope(void)
+{
+    return g_disable_rope;
+}
+
+void bread_set_trace_debug(int enabled)
+{
+    g_trace_debug = enabled ? 1 : 0;
+}
+
+int bread_get_trace_debug(void)
+{
+    return g_trace_debug;
+}
+
+void bread_set_trace_pos(int pos)
+{
+    g_trace_pos = pos;
+}
+
+int bread_get_trace_pos(void)
+{
+    return g_trace_pos;
 }
