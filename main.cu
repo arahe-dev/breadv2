@@ -57,7 +57,7 @@ extern float one_layer_last_branch_rms(void);
 
 /* kernels.cu */
 extern void bread_matvec(void *w, half *x, half *y,
-                          int rows, int cols, int qtype);
+                          int rows, int cols, int qtype, cudaStream_t stream);
 
 /* ------------------------------------------------------------------ */
 /* Q4K constants (must match kernels.cu)                               */
@@ -292,10 +292,10 @@ static void compute_logits(const bread_model_config_t *cfg,
 {
     if (output_w_type == GGML_TYPE_Q4_K) {
         bread_matvec(d_output_w, d_hidden, d_logits,
-                     cfg->vocab_size, cfg->hidden_dim, QTYPE_Q4_K);
+                     cfg->vocab_size, cfg->hidden_dim, QTYPE_Q4_K, stream_a);
     } else if (output_w_type == GGML_TYPE_Q6_K) {
         bread_matvec(d_output_w, d_hidden, d_logits,
-                     cfg->vocab_size, cfg->hidden_dim, QTYPE_Q6_K);
+                     cfg->vocab_size, cfg->hidden_dim, QTYPE_Q6_K, stream_a);
     } else if (output_w_type == GGML_TYPE_F16) {
         f16_matvec<<<cfg->vocab_size, 256, 0, stream_a>>>(
             (const half *)d_output_w, d_hidden, d_logits,

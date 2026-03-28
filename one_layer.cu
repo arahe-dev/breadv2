@@ -42,7 +42,7 @@
 /* ------------------------------------------------------------------ */
 
 extern void bread_matvec(void *w, half *x, half *y,
-                          int rows, int cols, int qtype);
+                          int rows, int cols, int qtype, cudaStream_t stream);
 
 /* ------------------------------------------------------------------ */
 /* File-scope scratch buffers for CPU conversion functions             */
@@ -1280,11 +1280,11 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         }
 
         bread_matvec(d_qw, d_normed, d_q,
-                     cfg->q_proj_dim,  H, GGML_TYPE_Q4_K);
+                     cfg->q_proj_dim,  H, GGML_TYPE_Q4_K, stream_a);
         bread_matvec(d_kw, d_normed, d_k,
-                     cfg->kv_proj_dim, H, GGML_TYPE_Q4_K);
+                     cfg->kv_proj_dim, H, GGML_TYPE_Q4_K, stream_a);
         bread_matvec(d_vw, d_normed, d_v,
-                     cfg->kv_proj_dim, H, GGML_TYPE_Q6_K);
+                     cfg->kv_proj_dim, H, GGML_TYPE_Q6_K, stream_a);
 
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         if (!wc) { cudaFree(d_qw); cudaFree(d_kw); cudaFree(d_vw); }
@@ -1389,13 +1389,13 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         }
 
         bread_matvec(d_qkv_w, d_normed, d_qkv,
-                     cfg->ssm_qkv_dim, H, GGML_TYPE_Q4_K);
+                     cfg->ssm_qkv_dim, H, GGML_TYPE_Q4_K, stream_a);
         bread_matvec(d_gate_w, d_normed, d_z,
-                     cfg->ssm_z_dim, H, GGML_TYPE_Q4_K);
+                     cfg->ssm_z_dim, H, GGML_TYPE_Q4_K, stream_a);
         bread_matvec(d_alpha_w, d_normed, d_alpha,
-                     cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K);
+                     cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K, stream_a);
         bread_matvec(d_beta_w, d_normed, d_beta,
-                     cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K);
+                     cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K, stream_a);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         if (!wc) {
@@ -1501,7 +1501,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         }
 
         bread_matvec(d_ow, d_attn_out, d_o_out,
-                     H, cfg->attn_out_dim, GGML_TYPE_Q4_K);
+                     H, cfg->attn_out_dim, GGML_TYPE_Q4_K, stream_a);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         if (!wc) cudaFree(d_ow);
         if (bread_get_trace_debug()) {
@@ -1521,7 +1521,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         }
 
         bread_matvec(d_sw, d_attn_out, d_o_out,
-                     H, cfg->ssm_z_dim, GGML_TYPE_Q4_K);
+                     H, cfg->ssm_z_dim, GGML_TYPE_Q4_K, stream_a);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         if (!wc) cudaFree(d_sw);
         if (bread_get_force_ssm_zero()) {
@@ -1572,9 +1572,9 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         }
 
         bread_matvec(d_sg_w, d_normed2, d_sg,
-                     cfg->shared_inter, H, GGML_TYPE_Q4_K);
+                     cfg->shared_inter, H, GGML_TYPE_Q4_K, stream_a);
         bread_matvec(d_su_w, d_normed2, d_su,
-                     cfg->shared_inter, H, GGML_TYPE_Q4_K);
+                     cfg->shared_inter, H, GGML_TYPE_Q4_K, stream_a);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         if (!wc) { cudaFree(d_sg_w); cudaFree(d_su_w); }
     }
@@ -1642,7 +1642,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         }
 
         bread_matvec(d_sd_w, d_sg, d_sh_out,
-                     H, cfg->shared_inter, GGML_TYPE_Q6_K);
+                     H, cfg->shared_inter, GGML_TYPE_Q6_K, stream_a);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
         if (!wc) cudaFree(d_sd_w);
 
@@ -1689,9 +1689,9 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
             /* gate/up projections: normed2[H] → gate/up[EXPERT_INTER] */
             bread_matvec(ep.gate, d_normed2, d_eg,
-                         cfg->expert_inter, H, (int)ep.gate_type);
+                         cfg->expert_inter, H, (int)ep.gate_type, stream_a);
             bread_matvec(ep.up,  d_normed2, d_eu,
-                         cfg->expert_inter, H, (int)ep.up_type);
+                         cfg->expert_inter, H, (int)ep.up_type, stream_a);
 
             /* SwiGLU in-place on gate */
             silu_mul_inplace<<<n_blocks_ei, 256, 0, stream_a>>>(
@@ -1699,7 +1699,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
             /* down projection: gate[EXPERT_INTER] → expert_out[H] */
             bread_matvec(ep.down, d_eg, d_eo,
-                         H, cfg->expert_inter, (int)ep.down_type);
+                         H, cfg->expert_inter, (int)ep.down_type, stream_a);
 
             CUDA_CHECK(cudaStreamSynchronize(stream_a));
 

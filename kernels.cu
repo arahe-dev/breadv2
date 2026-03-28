@@ -239,16 +239,16 @@ __global__ void dequant_q6k_matvec(
 /* ------------------------------------------------------------------ */
 /* Host dispatcher                                                      */
 /* ------------------------------------------------------------------ */
-void bread_matvec(void *w, half *x, half *y, int rows, int cols, int qtype)
+void bread_matvec(void *w, half *x, half *y, int rows, int cols, int qtype, cudaStream_t stream)
 {
     dim3 grid(rows);
     dim3 block(THREADS_PER_ROW);
 
     if (qtype == QTYPE_Q4_K) {
-        dequant_q4k_matvec<<<grid, block>>>(
+        dequant_q4k_matvec<<<grid, block, 0, stream>>>(
             (const uint8_t *)w, x, y, rows, cols);
     } else if (qtype == QTYPE_Q6_K) {
-        dequant_q6k_matvec<<<grid, block>>>(
+        dequant_q6k_matvec<<<grid, block, 0, stream>>>(
             (const uint8_t *)w, x, y, rows, cols);
     } else {
         fprintf(stderr, "bread_matvec: unknown qtype %d\n", qtype);
