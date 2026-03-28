@@ -36,6 +36,7 @@
 #include "gguf.h"
 #include "loader.h"
 #include "bread_utils.h"
+#include "layer_ops.h"
 
 /* ------------------------------------------------------------------ */
 /* External: bread_matvec from kernels.cu                              */
@@ -125,7 +126,7 @@ static __global__ void copy_half(half *dst, const half *src, int n)
 /* ------------------------------------------------------------------ */
 
 /* Pointer to tensor data in pinned host RAM */
-static const gguf_tensor_t *require_tensor(const gguf_ctx_t *g, const char *name)
+const gguf_tensor_t *require_tensor(const gguf_ctx_t *g, const char *name)
 {
     const gguf_tensor_t *t = gguf_find_tensor(g, name);
     if (!t) {
@@ -135,8 +136,8 @@ static const gguf_tensor_t *require_tensor(const gguf_ctx_t *g, const char *name
     return t;
 }
 
-static uint8_t *tensor_ram(const loader_t *L, const gguf_ctx_t *g,
-                           const char *name)
+uint8_t *tensor_ram(const loader_t *L, const gguf_ctx_t *g,
+                    const char *name)
 {
     const gguf_tensor_t *t = require_tensor(g, name);
     return L->pinned_data + L->data_offset + t->offset;
