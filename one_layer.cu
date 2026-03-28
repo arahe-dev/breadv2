@@ -1397,7 +1397,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                      cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K, stream_a);
         bread_matvec(d_beta_w, d_normed, d_beta,
                      cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K, stream_a);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaStreamSynchronize(stream_a));
 
         if (!wc) {
             cudaFree(d_qkv_w);
@@ -1558,33 +1558,36 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     }
 
     /* ================================================================
-     * CMD2c: shared-expert gate/up projections
+     * Phase 4 Optimization: Overlap CPU routing with GPU work
+     *
+     * P4-3: Submit shared gate+up to stream_a WITHOUT syncing,
+     * then run CPU routing (vram_copy + router matmul) while GPU executes.
+     * Sync stream_a AFTER routing completes.
      * ================================================================ */
-    {
-        void *d_sg_w, *d_su_w;
-        if (wc) {
-            d_sg_w = wc->layers[layer_idx].ffn_gate_shexp_w;
-            d_su_w = wc->layers[layer_idx].ffn_up_shexp_w;
-        } else {
-            snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_shexp.weight", layer_idx);
-            d_sg_w = load_vram(L, g, nm);
-            snprintf(nm, sizeof(nm), "blk.%d.ffn_up_shexp.weight", layer_idx);
-            d_su_w = load_vram(L, g, nm);
-        }
 
-        bread_matvec(d_sg_w, d_normed2, d_sg,
-                     cfg->shared_inter, H, GGML_TYPE_Q4_K, stream_a);
-        bread_matvec(d_su_w, d_normed2, d_su,
-                     cfg->shared_inter, H, GGML_TYPE_Q4_K, stream_a);
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        if (!wc) { cudaFree(d_sg_w); cudaFree(d_su_w); }
+    /* CMD2c: submit shared gate+up to GPU — NO sync here */
+    void *d_sg_w, *d_su_w;
+    if (wc) {
+        d_sg_w = wc->layers[layer_idx].ffn_gate_shexp_w;
+        d_su_w = wc->layers[layer_idx].ffn_up_shexp_w;
+    } else {
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_shexp.weight", layer_idx);
+        d_sg_w = load_vram(L, g, nm);
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_up_shexp.weight", layer_idx);
+        d_su_w = load_vram(L, g, nm);
     }
 
-    /* ================================================================
-     * CPU routing: router matmul (F32) + softmax + topK
-     *
-     * router weight: blk.N.ffn_gate_inp.weight [H × NUM_EXPERTS] F32
-     * ================================================================ */
+    bread_matvec(d_sg_w, d_normed2, d_sg,
+                 cfg->shared_inter, H, GGML_TYPE_Q4_K, stream_a);
+    bread_matvec(d_su_w, d_normed2, d_su,
+                 cfg->shared_inter, H, GGML_TYPE_Q4_K, stream_a);
+    /* NOTE: no sync yet — gate+up runs on GPU while CPU does routing below */
+
+    /* CPU routing: router matmul (F32) + softmax + topK
+     * This runs while stream_a executes shared gate+up matvecs (~8 μs GPU work).
+     * vram_half_to_cpu_float uses cudaMemcpy(DeviceToHost) which syncs the default
+     * stream only, not stream_a. Both can read d_normed2 concurrently (safe).
+     */
     int   *expert_indices = NULL;
     float *expert_weights = NULL;
     float shared_gate_score = 0.0f;
@@ -1597,8 +1600,8 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         const half *shared_gate_w = NULL;
         if (gguf_find_tensor(g, nm)) shared_gate_w = tensor_ram_f16(L, g, nm);
 
-        /* Copy d_normed2 → CPU float */
-        float *normed_f32 = h_normed2;      /* pre-allocated static buffer (different branch) */
+        /* Copy d_normed2 → CPU float (default stream cudaMemcpy, doesn't wait for stream_a) */
+        float *normed_f32 = h_normed2;      /* pre-allocated static buffer */
         float *logits = h_logits;           /* pre-allocated static buffer */
         vram_half_to_cpu_float(d_normed2, normed_f32, H);
 
@@ -1618,16 +1621,22 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                  expert_indices, expert_weights);
     }
 
+    /* Sync stream_a for shared gate+up (should complete in ~8 μs, routing took ~500 μs → 0 wait) */
+    CUDA_CHECK(cudaStreamSynchronize(stream_a));
+    if (!wc) { cudaFree(d_sg_w); cudaFree(d_su_w); }
+
     /* ================================================================
      * DMA: Stream B — load K expert weight sets into VRAM
+     * Fire DMA immediately, then overlap with shared SwiGLU+down on stream_a
      * ================================================================ */
     if (!bread_get_boring_mode()) {
         loader_request(L, layer_idx, expert_indices, cfg->top_k);
-        loader_sync(L);
+        /* NOTE: no loader_sync here — DMA runs in background while we do shared down */
     }
 
     /* ================================================================
      * CMD3a: shared expert SwiGLU + down projection → accumulate
+     * Overlaps with DMA (loader_request already fired above)
      * ================================================================ */
     {
         int n_blocks_si = (cfg->shared_inter + 255) / 256;
@@ -1653,6 +1662,11 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             scale_accum<<<blocks, 256, 0, stream_a>>>(d_hidden, d_sh_out, shared_weight, H);
             CUDA_CHECK(cudaStreamSynchronize(stream_a));
         }
+    }
+
+    /* Now wait for DMA to complete before accessing expert VRAM */
+    if (!bread_get_boring_mode()) {
+        loader_sync(L);
     }
 
     /* ================================================================
@@ -1702,17 +1716,17 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             bread_matvec(ep.down, d_eg, d_eo,
                          H, cfg->expert_inter, (int)ep.down_type, stream_a);
 
-            CUDA_CHECK(cudaStreamSynchronize(stream_a));
-
             /* Weighted accumulate into hidden */
             scale_accum<<<n_blocks_h, 256, 0, stream_a>>>(
                 d_hidden, d_eo, expert_weights[k], H);
-            CUDA_CHECK(cudaStreamSynchronize(stream_a));
+            /* No intermediate syncs — all on same stream, GPU handles ordering */
 
             if (tmp_gate) cudaFree(tmp_gate);
             if (tmp_up) cudaFree(tmp_up);
             if (tmp_down) cudaFree(tmp_down);
         }
+        /* Flush all expert kernels to GPU (single sync instead of per-expert) */
+        CUDA_CHECK(cudaStreamSynchronize(stream_a));
     }
     /* d_hidden now contains the full transformer block output */
 }
