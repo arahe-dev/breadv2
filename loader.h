@@ -73,6 +73,37 @@ typedef struct {
 } expert_ptrs_t;
 
 /* ------------------------------------------------------------------ */
+/* Non-expert weight cache — per-layer VRAM pointers                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    /* Common tensors — all 40 layers */
+    void *attn_norm_w;          /* F32  — blk.N.attn_norm.weight           */
+    void *post_attn_norm_w;     /* F32  — blk.N.post_attention_norm.weight */
+    void *ffn_gate_shexp_w;     /* Q4_K — blk.N.ffn_gate_shexp.weight      */
+    void *ffn_up_shexp_w;       /* Q4_K — blk.N.ffn_up_shexp.weight        */
+    void *ffn_down_shexp_w;     /* Q6_K — blk.N.ffn_down_shexp.weight      */
+
+    /* Full-attention only (NULL for SSM layers) */
+    void *attn_q_w;             /* Q4_K — blk.N.attn_q.weight              */
+    void *attn_k_w;             /* Q4_K — blk.N.attn_k.weight              */
+    void *attn_v_w;             /* Q6_K — blk.N.attn_v.weight              */
+    void *attn_output_w;        /* Q4_K — blk.N.attn_output.weight         */
+
+    /* SSM only (NULL for full-attention layers) */
+    void *attn_qkv_w;           /* Q4_K — blk.N.attn_qkv.weight            */
+    void *attn_gate_w;          /* Q4_K — blk.N.attn_gate.weight           */
+    void *ssm_alpha_w;          /* Q4_K — blk.N.ssm_alpha.weight           */
+    void *ssm_beta_w;           /* Q4_K — blk.N.ssm_beta.weight            */
+    void *ssm_out_w;            /* Q4_K — blk.N.ssm_out.weight             */
+} wc_layer_t;
+
+typedef struct {
+    wc_layer_t layers[40];      /* one entry per transformer block */
+    uint64_t   total_bytes;     /* total VRAM consumed — for reporting */
+} weight_cache_t;
+
+/* ------------------------------------------------------------------ */
 /* Loader context                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -133,6 +164,16 @@ expert_ptrs_t loader_get_expert(const loader_t *L,
 /* Run a self-test: load the model, request expert(0,0), verify non-zero
  * data landed in VRAM. Returns 0 on success, 1 on failure. */
 int loader_selftest(const char *model_path);
+
+/* Upload all non-expert weights to VRAM once. Call after loader_init().
+ * is_full_attn_fn: pass bread_layer_is_full_attention — avoids pulling
+ * bread.h into loader.h, keeping the boundary clean. Returns NULL on failure. */
+weight_cache_t *weight_cache_init(const loader_t *L, const gguf_ctx_t *g,
+                                  int num_layers,
+                                  int (*is_full_attn_fn)(int layer_idx));
+
+/* Free all VRAM allocations in the weight cache and the struct itself. */
+void weight_cache_free(weight_cache_t *wc);
 
 #ifdef __cplusplus
 }

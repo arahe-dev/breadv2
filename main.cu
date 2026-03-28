@@ -61,6 +61,7 @@ static double now_ms(void) {
 /* one_layer.cu */
 extern void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                                loader_t *L, gguf_ctx_t *g,
+                               weight_cache_t *wc,
                                cudaStream_t stream_a);
 extern float one_layer_cpu_hidden_rms(int hidden_dim);
 extern float one_layer_last_branch_rms(void);
@@ -441,6 +442,12 @@ int main(int argc, char **argv)
     }
     const bread_model_config_t *cfg = bread_model_config_get();
 
+    /* -- Pre-load non-expert weights to VRAM cache ------------------- */
+    printf("      Initializing weight cache...\n");
+    weight_cache_t *wc = weight_cache_init(L, g, cfg->num_layers,
+                                           bread_layer_is_full_attention);
+    if (!wc) { fprintf(stderr, "weight_cache_init failed\n"); return 1; }
+
     /* -- Load tokenizer --------------------------------------------- */
     printf("[2/4] Loading tokenizer...\n");
     tokenizer_t *tok = tokenizer_load(model_path);
@@ -533,7 +540,7 @@ int main(int argc, char **argv)
         }
         for (int layer = 0; layer < cfg->num_layers; layer++)
         {
-            one_layer_forward(d_hidden, layer, p, L, g, stream_a);
+            one_layer_forward(d_hidden, layer, p, L, g, wc, stream_a);
             if (debug_rms && p == n_prompt - 1) {
                 float hidden_rms = minimal_mode
                     ? one_layer_cpu_hidden_rms(cfg->hidden_dim)
@@ -588,7 +595,7 @@ int main(int argc, char **argv)
         embed_token(next_tok, cfg, L, g, d_hidden, h_emb_row);
 
         for (int layer = 0; layer < cfg->num_layers; layer++) {
-            one_layer_forward(d_hidden, layer, n_prompt + n_gen, L, g, stream_a);
+            one_layer_forward(d_hidden, layer, n_prompt + n_gen, L, g, wc, stream_a);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -635,6 +642,7 @@ int main(int argc, char **argv)
     cudaFree(d_norm_w);
     cudaFree(d_output_w);
     cudaStreamDestroy(stream_a);
+    weight_cache_free(wc);
     tokenizer_free(tok);
     gguf_close(g);
     loader_free(L);

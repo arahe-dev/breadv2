@@ -432,6 +432,153 @@ expert_ptrs_t loader_get_expert(const loader_t *L,
 }
 
 /* ================================================================== */
+/*  W E I G H T   C A C H E                                            */
+/* ================================================================== */
+
+/* Helper: upload a single weight tensor from host RAM to VRAM.
+ * Returns VRAM pointer, or NULL if tensor not found. */
+static void *wc_upload(const loader_t *L, const gguf_ctx_t *g,
+                        const char *name, uint64_t *out_bytes)
+{
+    const gguf_tensor_t *t = gguf_find_tensor(g, name);
+    if (!t) {
+        fprintf(stderr, "weight_cache: tensor '%s' not found in GGUF\n", name);
+        return NULL;
+    }
+
+    void *d = NULL;
+    CUDA_CHECK(cudaMalloc(&d, t->size));
+    CUDA_CHECK(cudaMemcpy(d, L->pinned_data + L->data_offset + t->offset,
+                           t->size, cudaMemcpyHostToDevice));
+
+    *out_bytes += t->size;
+    return d;
+}
+
+/* Initialize weight cache: pre-load all non-expert weights to VRAM.
+ * is_full_attn_fn: function pointer to bread_layer_is_full_attention(). */
+weight_cache_t *weight_cache_init(const loader_t *L, const gguf_ctx_t *g,
+                                  int num_layers,
+                                  int (*is_full_attn_fn)(int layer_idx))
+{
+    weight_cache_t *wc = (weight_cache_t *)calloc(1, sizeof(weight_cache_t));
+    if (!wc) {
+        fprintf(stderr, "weight_cache_init: calloc failed\n");
+        return NULL;
+    }
+
+    char name[256];
+    int failed = 0;
+
+    /* Load weights for all layers */
+    for (int layer = 0; layer < num_layers; layer++) {
+        wc_layer_t *wcl = &wc->layers[layer];
+
+        /* Common tensors (all layers) */
+        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
+        wcl->attn_norm_w = wc_upload(L, g, name, &wc->total_bytes);
+        if (!wcl->attn_norm_w) failed = 1;
+
+        snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", layer);
+        wcl->post_attn_norm_w = wc_upload(L, g, name, &wc->total_bytes);
+        if (!wcl->post_attn_norm_w) failed = 1;
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", layer);
+        wcl->ffn_gate_shexp_w = wc_upload(L, g, name, &wc->total_bytes);
+        if (!wcl->ffn_gate_shexp_w) failed = 1;
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", layer);
+        wcl->ffn_up_shexp_w = wc_upload(L, g, name, &wc->total_bytes);
+        if (!wcl->ffn_up_shexp_w) failed = 1;
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", layer);
+        wcl->ffn_down_shexp_w = wc_upload(L, g, name, &wc->total_bytes);
+        if (!wcl->ffn_down_shexp_w) failed = 1;
+
+        /* Path-specific tensors */
+        if (is_full_attn_fn(layer)) {
+            /* Full-attention layer */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.weight", layer);
+            wcl->attn_q_w = wc_upload(L, g, name, &wc->total_bytes);
+            if (!wcl->attn_q_w) failed = 1;
+
+            snprintf(name, sizeof(name), "blk.%d.attn_k.weight", layer);
+            wcl->attn_k_w = wc_upload(L, g, name, &wc->total_bytes);
+            if (!wcl->attn_k_w) failed = 1;
+
+            snprintf(name, sizeof(name), "blk.%d.attn_v.weight", layer);
+            wcl->attn_v_w = wc_upload(L, g, name, &wc->total_bytes);
+            if (!wcl->attn_v_w) failed = 1;
+
+            snprintf(name, sizeof(name), "blk.%d.attn_output.weight", layer);
+            wcl->attn_output_w = wc_upload(L, g, name, &wc->total_bytes);
+            if (!wcl->attn_output_w) failed = 1;
+        } else {
+            /* SSM layer */
+            snprintf(name, sizeof(name), "blk.%d.attn_qkv.weight", layer);
+            wcl->attn_qkv_w = wc_upload(L, g, name, &wc->total_bytes);
+            if (!wcl->attn_qkv_w) failed = 1;
+
+            snprintf(name, sizeof(name), "blk.%d.attn_gate.weight", layer);
+            wcl->attn_gate_w = wc_upload(L, g, name, &wc->total_bytes);
+            if (!wcl->attn_gate_w) failed = 1;
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_alpha.weight", layer);
+            wcl->ssm_alpha_w = wc_upload(L, g, name, &wc->total_bytes);
+            if (!wcl->ssm_alpha_w) failed = 1;
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_beta.weight", layer);
+            wcl->ssm_beta_w = wc_upload(L, g, name, &wc->total_bytes);
+            if (!wcl->ssm_beta_w) failed = 1;
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_out.weight", layer);
+            wcl->ssm_out_w = wc_upload(L, g, name, &wc->total_bytes);
+            if (!wcl->ssm_out_w) failed = 1;
+        }
+    }
+
+    if (failed) {
+        fprintf(stderr, "weight_cache_init: one or more tensors failed to load\n");
+        weight_cache_free(wc);
+        return NULL;
+    }
+
+    printf("weight_cache: loaded %d layers, %.1f MiB VRAM\n",
+           num_layers, wc->total_bytes / (1024.0 * 1024.0));
+
+    return wc;
+}
+
+/* Free all VRAM allocations in the weight cache. */
+void weight_cache_free(weight_cache_t *wc)
+{
+    if (!wc) return;
+
+    for (int layer = 0; layer < 40; layer++) {
+        wc_layer_t *wcl = &wc->layers[layer];
+
+        if (wcl->attn_norm_w)       CUDA_CHECK(cudaFree(wcl->attn_norm_w));
+        if (wcl->post_attn_norm_w)  CUDA_CHECK(cudaFree(wcl->post_attn_norm_w));
+        if (wcl->ffn_gate_shexp_w)  CUDA_CHECK(cudaFree(wcl->ffn_gate_shexp_w));
+        if (wcl->ffn_up_shexp_w)    CUDA_CHECK(cudaFree(wcl->ffn_up_shexp_w));
+        if (wcl->ffn_down_shexp_w)  CUDA_CHECK(cudaFree(wcl->ffn_down_shexp_w));
+
+        if (wcl->attn_q_w)          CUDA_CHECK(cudaFree(wcl->attn_q_w));
+        if (wcl->attn_k_w)          CUDA_CHECK(cudaFree(wcl->attn_k_w));
+        if (wcl->attn_v_w)          CUDA_CHECK(cudaFree(wcl->attn_v_w));
+        if (wcl->attn_output_w)     CUDA_CHECK(cudaFree(wcl->attn_output_w));
+
+        if (wcl->attn_qkv_w)        CUDA_CHECK(cudaFree(wcl->attn_qkv_w));
+        if (wcl->attn_gate_w)       CUDA_CHECK(cudaFree(wcl->attn_gate_w));
+        if (wcl->ssm_alpha_w)       CUDA_CHECK(cudaFree(wcl->ssm_alpha_w));
+        if (wcl->ssm_beta_w)        CUDA_CHECK(cudaFree(wcl->ssm_beta_w));
+        if (wcl->ssm_out_w)         CUDA_CHECK(cudaFree(wcl->ssm_out_w));
+    }
+
+    free(wc);
+}
+
+/* ================================================================== */
 /*  S E L F T E S T                                                    */
 /* ================================================================== */
 #ifdef SELFTEST_MAIN
