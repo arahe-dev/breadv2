@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <ctype.h>
 
 #include "tokenizer.h"
 
@@ -286,6 +287,7 @@ struct tokenizer_t {
     int32_t   bos_id;
     int32_t   eos_id;
     char     *pre_name;
+    int32_t  *token_types;
     hmap_t   *tok_to_id;   /* token string → id */
     hmap_t   *merge_rank;  /* "A B" → merge rank (array index) */
     int32_t   num_merges;
@@ -299,6 +301,30 @@ struct tokenizer_t {
 static int looks_like_special_token(const char *s);
 static int match_special_token(const tokenizer_t *tok, const uint8_t *data, int n,
                                int32_t *out_id);
+
+enum {
+    TOK_TYPE_UNDEFINED    = 0,
+    TOK_TYPE_NORMAL       = 1,
+    TOK_TYPE_UNKNOWN      = 2,
+    TOK_TYPE_CONTROL      = 3,
+    TOK_TYPE_USER_DEFINED = 4,
+    TOK_TYPE_UNUSED       = 5,
+    TOK_TYPE_BYTE         = 6,
+};
+
+static int32_t *read_i32_array(FILE *fp, uint32_t et, uint64_t cnt) {
+    int32_t *arr = (int32_t *)malloc((size_t)cnt * sizeof(int32_t));
+    if (!arr) tok_fatal("OOM allocating int32 array");
+    if (et == 4) {
+        for (uint64_t i = 0; i < cnt; i++) arr[i] = (int32_t)r_u32(fp);
+    } else if (et == 5) {
+        for (uint64_t i = 0; i < cnt; i++) arr[i] = r_i32(fp);
+    } else {
+        free(arr);
+        return NULL;
+    }
+    return arr;
+}
 
 /* ------------------------------------------------------------------ */
 /* Load tokenizer from GGUF file                                       */
@@ -333,6 +359,7 @@ tokenizer_t *tokenizer_load(const char *model_path) {
     int32_t  n_tokens = 0;
     char   **merges   = NULL;
     int32_t  n_merges = 0;
+    int32_t *token_types = NULL;
 
     /* --- Scan metadata KV pairs --- */
     for (uint64_t ki = 0; ki < n_kv; ki++) {
@@ -364,11 +391,14 @@ tokenizer_t *tokenizer_load(const char *model_path) {
             }
             handled = 1;
 
-        /* tokenizer.ggml.token_type — ARRAY(INT32), skip */
+        /* tokenizer.ggml.token_type — ARRAY(INT32) */
         } else if (strcmp(key, "tokenizer.ggml.token_type") == 0 && vtype == 9) {
             uint32_t et  = r_u32(fp);
             uint64_t cnt = r_u64(fp);
-            skip_fixed_array(fp, et, cnt);
+            token_types = read_i32_array(fp, et, cnt);
+            if (!token_types) {
+                skip_fixed_array(fp, et, cnt);
+            }
             handled = 1;
 
         /* tokenizer.ggml.scores — ARRAY(FLOAT32), skip */
@@ -412,6 +442,7 @@ tokenizer_t *tokenizer_load(const char *model_path) {
     /* --- Build vocab tables --- */
     tok->vocab_size = n_tokens;
     tok->id_to_tok  = tokens;
+    tok->token_types = token_types;
     tok->tok_to_id  = hm_new((uint32_t)n_tokens * 2 + 3);
     for (int32_t i = 0; i < n_tokens; i++)
         hm_put(tok->tok_to_id, tokens[i], i);
@@ -422,7 +453,16 @@ tokenizer_t *tokenizer_load(const char *model_path) {
     tok->num_specials = 0;
     tok->max_special_len = 0;
     for (int32_t i = 0; i < n_tokens; i++) {
-        if (looks_like_special_token(tokens[i])) {
+        int is_special = 0;
+        if (tok->token_types) {
+            const int32_t tt = tok->token_types[i];
+            is_special = (tt == TOK_TYPE_CONTROL ||
+                          tt == TOK_TYPE_USER_DEFINED ||
+                          tt == TOK_TYPE_UNKNOWN);
+        } else {
+            is_special = looks_like_special_token(tokens[i]);
+        }
+        if (is_special) {
             tok->special_texts[tok->num_specials] = tokens[i];
             tok->special_ids[tok->num_specials] = i;
             tok->num_specials++;
@@ -458,6 +498,7 @@ void tokenizer_free(tokenizer_t *tok) {
     if (tok->merge_rank)  hm_free(tok->merge_rank);
     free(tok->special_texts);
     free(tok->special_ids);
+    free(tok->token_types);
     if (tok->pre_name)    free(tok->pre_name);
     free(tok);
 }
@@ -586,6 +627,59 @@ static int is_ascii_digit(uint8_t c) {
     return (c >= '0' && c <= '9');
 }
 
+static int utf8_peek_cp(const uint8_t *data, int n, uint32_t *out_cp) {
+    if (n <= 0) return 0;
+    if (data[0] < 0x80u) {
+        *out_cp = data[0];
+        return 1;
+    }
+    if ((data[0] & 0xE0u) == 0xC0u && n >= 2) {
+        *out_cp = ((uint32_t)(data[0] & 0x1Fu) << 6) |
+                  (uint32_t)(data[1] & 0x3Fu);
+        return 2;
+    }
+    if ((data[0] & 0xF0u) == 0xE0u && n >= 3) {
+        *out_cp = ((uint32_t)(data[0] & 0x0Fu) << 12) |
+                  ((uint32_t)(data[1] & 0x3Fu) << 6) |
+                  (uint32_t)(data[2] & 0x3Fu);
+        return 3;
+    }
+    if ((data[0] & 0xF8u) == 0xF0u && n >= 4) {
+        *out_cp = ((uint32_t)(data[0] & 0x07u) << 18) |
+                  ((uint32_t)(data[1] & 0x3Fu) << 12) |
+                  ((uint32_t)(data[2] & 0x3Fu) << 6) |
+                  (uint32_t)(data[3] & 0x3Fu);
+        return 4;
+    }
+    *out_cp = data[0];
+    return 1;
+}
+
+static int cp_is_newline(uint32_t cp) {
+    return cp == '\r' || cp == '\n';
+}
+
+static int cp_is_space(uint32_t cp) {
+    return cp == ' ' || cp == '\t' || cp == '\v' || cp == '\f' || cp_is_newline(cp);
+}
+
+static int cp_is_digit(uint32_t cp) {
+    return cp <= 0x7Fu && is_ascii_digit((uint8_t)cp);
+}
+
+static int cp_is_letter_mark(uint32_t cp) {
+    if (cp <= 0x7Fu) return is_ascii_alpha((uint8_t)cp);
+    /* Qwen35 treats non-ASCII letters/marks as part of word spans.
+     * We conservatively classify non-ASCII non-space non-digit codepoints
+     * as letter-ish here so multilingual text stays grouped instead of
+     * degenerating into byte-wise spans. */
+    return !cp_is_space(cp) && !cp_is_digit(cp);
+}
+
+static int cp_is_qwen35_punct(uint32_t cp) {
+    return !cp_is_space(cp) && !cp_is_letter_mark(cp) && !cp_is_digit(cp);
+}
+
 static int looks_like_special_token(const char *s) {
     size_t n = strlen(s);
     if (n < 3) return 0;
@@ -614,12 +708,45 @@ static int match_special_token(const tokenizer_t *tok, const uint8_t *data, int 
     return best_len;
 }
 
-static int match_ascii_contraction(const uint8_t *data, int n, int i) {
+static int find_next_special_token(const tokenizer_t *tok, const uint8_t *data, int n,
+                                   int *out_off, int32_t *out_id, int *out_len) {
+    int best_off = -1;
+    int best_len = 0;
+    int32_t best_id = -1;
+    for (int off = 0; off < n; off++) {
+        int32_t id = -1;
+        int len = match_special_token(tok, data + off, n - off, &id);
+        if (len <= 0) continue;
+        if (best_off < 0 || off < best_off || (off == best_off && len > best_len)) {
+            best_off = off;
+            best_len = len;
+            best_id = id;
+            if (best_off == 0 && best_len == tok->max_special_len) break;
+        }
+    }
+    if (best_off < 0) return 0;
+    if (out_off) *out_off = best_off;
+    if (out_id)  *out_id  = best_id;
+    if (out_len) *out_len = best_len;
+    return 1;
+}
+
+static int match_ascii_contraction_ci(const uint8_t *data, int n, int i) {
     static const char *suffixes[] = { "'s", "'t", "'re", "'ve", "'m", "'ll", "'d" };
     if (i >= n || data[i] != '\'') return 0;
     for (int k = 0; k < (int)(sizeof(suffixes) / sizeof(suffixes[0])); k++) {
         int len = (int)strlen(suffixes[k]);
-        if (i + len <= n && memcmp(data + i, suffixes[k], (size_t)len) == 0) return len;
+        int ok = 1;
+        if (i + len > n) continue;
+        for (int j = 0; j < len; j++) {
+            unsigned char a = data[i + j];
+            unsigned char b = (unsigned char)suffixes[k][j];
+            if (tolower(a) != tolower(b)) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) return len;
     }
     return 0;
 }
@@ -637,32 +764,122 @@ static int encode_piece_bytes(const tokenizer_t *tok, const uint8_t *data, int n
     return total;
 }
 
-int tokenizer_encode(const tokenizer_t *tok, const char *text,
-                     int32_t *out, int max_out) {
-    int n = (int)strlen(text);
+static int encode_qwen35_raw(const tokenizer_t *tok, const uint8_t *data, int n,
+                             int32_t *out, int max_out) {
+    int total = 0;
+    int i = 0;
+
+    while (i < n && total < max_out) {
+        const int start = i;
+        uint32_t cp0 = 0, cp1 = 0;
+        int len0 = utf8_peek_cp(data + i, n - i, &cp0);
+        int len1 = 0;
+        int c_len = 0;
+
+        if ((c_len = match_ascii_contraction_ci(data, n, i)) > 0) {
+            i += c_len;
+        } else if (cp_is_letter_mark(cp0)) {
+            i += len0;
+            while (i < n) {
+                int len = utf8_peek_cp(data + i, n - i, &cp1);
+                if (!cp_is_letter_mark(cp1)) break;
+                i += len;
+            }
+        } else if (cp_is_digit(cp0)) {
+            i += len0; /* Qwen35 uses \p{N}, one digit/codepoint at a time */
+        } else if (cp_is_newline(cp0)) {
+            i += len0;
+            while (i < n) {
+                int len = utf8_peek_cp(data + i, n - i, &cp1);
+                if (!cp_is_newline(cp1)) break;
+                i += len;
+            }
+        } else if (cp_is_space(cp0)) {
+            int j = i;
+            while (j < n) {
+                int len = utf8_peek_cp(data + j, n - j, &cp1);
+                if (!cp_is_space(cp1) || cp_is_newline(cp1)) break;
+                j += len;
+            }
+            len1 = utf8_peek_cp(data + j, n - j, &cp1);
+            if (j < n && cp_is_newline(cp1)) {
+                i = j + len1;
+                while (i < n) {
+                    int len = utf8_peek_cp(data + i, n - i, &cp1);
+                    if (!cp_is_newline(cp1)) break;
+                    i += len;
+                }
+            } else if (cp0 == ' ' && j == i + 1 && j < n && cp_is_letter_mark(cp1)) {
+                i = j + len1;
+                while (i < n) {
+                    int len = utf8_peek_cp(data + i, n - i, &cp1);
+                    if (!cp_is_letter_mark(cp1)) break;
+                    i += len;
+                }
+            } else if (cp0 == ' ' && j == i + 1 && j < n && cp_is_qwen35_punct(cp1)) {
+                i = j + len1;
+                while (i < n) {
+                    int len = utf8_peek_cp(data + i, n - i, &cp1);
+                    if (!cp_is_qwen35_punct(cp1)) break;
+                    i += len;
+                }
+                while (i < n) {
+                    int len = utf8_peek_cp(data + i, n - i, &cp1);
+                    if (!cp_is_newline(cp1)) break;
+                    i += len;
+                }
+            } else {
+                i = j;
+            }
+        } else {
+            len1 = utf8_peek_cp(data + i + len0, n - (i + len0), &cp1);
+            if (!cp_is_newline(cp0) && !cp_is_letter_mark(cp0) && !cp_is_digit(cp0) &&
+                len1 > 0 && cp_is_letter_mark(cp1)) {
+                i += len0 + len1;
+                while (i < n) {
+                    int len = utf8_peek_cp(data + i, n - i, &cp1);
+                    if (!cp_is_letter_mark(cp1)) break;
+                    i += len;
+                }
+            } else {
+                i += len0;
+                while (i < n) {
+                    int len = utf8_peek_cp(data + i, n - i, &cp1);
+                    if (!cp_is_qwen35_punct(cp1)) break;
+                    i += len;
+                }
+                while (i < n) {
+                    int len = utf8_peek_cp(data + i, n - i, &cp1);
+                    if (!cp_is_newline(cp1)) break;
+                    i += len;
+                }
+            }
+        }
+
+        if (i > start) {
+            total += encode_piece_bytes(tok, data + start, i - start, out + total, max_out - total);
+        } else {
+            i += len0 > 0 ? len0 : 1;
+        }
+    }
+
+    return total;
+}
+
+static int encode_basic_raw(const tokenizer_t *tok, const uint8_t *data, int n,
+                            int32_t *out, int max_out) {
     int i = 0;
     int total = 0;
-    const uint8_t *data = (const uint8_t *)text;
-
-    if (n <= 0 || max_out <= 0) return 0;
 
     while (i < n && total < max_out) {
         int start = i;
         int len = 0;
         int c_len;
-        int32_t special_id = -1;
-
-        c_len = match_special_token(tok, data + i, n - i, &special_id);
-        if (c_len > 0) {
-            out[total++] = special_id;
-            i += c_len;
-            continue;
-        }
 
         if (is_ascii_space(data[i])) {
             if (i + 1 < n && !is_ascii_space(data[i + 1])) {
                 i++;
-                c_len = match_ascii_contraction(data, n, i);
+                c_len = match_ascii_contraction_ci(data, n, i);
                 if (c_len > 0) {
                     i += c_len;
                 } else if (is_ascii_alpha(data[i])) {
@@ -672,7 +889,7 @@ int tokenizer_encode(const tokenizer_t *tok, const char *text,
                 } else {
                     while (i < n && !is_ascii_space(data[i]) &&
                            !is_ascii_alpha(data[i]) && !is_ascii_digit(data[i]) &&
-                           match_ascii_contraction(data, n, i) == 0) {
+                           match_ascii_contraction_ci(data, n, i) == 0) {
                         i++;
                     }
                 }
@@ -680,7 +897,7 @@ int tokenizer_encode(const tokenizer_t *tok, const char *text,
                 while (i < n && is_ascii_space(data[i])) i++;
             }
         } else {
-            c_len = match_ascii_contraction(data, n, i);
+            c_len = match_ascii_contraction_ci(data, n, i);
             if (c_len > 0) {
                 i += c_len;
             } else if (is_ascii_alpha(data[i])) {
@@ -690,7 +907,7 @@ int tokenizer_encode(const tokenizer_t *tok, const char *text,
             } else {
                 while (i < n && !is_ascii_space(data[i]) &&
                        !is_ascii_alpha(data[i]) && !is_ascii_digit(data[i]) &&
-                       match_ascii_contraction(data, n, i) == 0) {
+                       match_ascii_contraction_ci(data, n, i) == 0) {
                     i++;
                 }
             }
@@ -701,6 +918,41 @@ int tokenizer_encode(const tokenizer_t *tok, const char *text,
             total += encode_piece_bytes(tok, data + start, len, out + total, max_out - total);
         } else {
             i++;
+        }
+    }
+
+    return total;
+}
+
+int tokenizer_encode(const tokenizer_t *tok, const char *text,
+                     int32_t *out, int max_out) {
+    int n = (int)strlen(text);
+    int pos = 0;
+    int total = 0;
+    const uint8_t *data = (const uint8_t *)text;
+
+    if (n <= 0 || max_out <= 0) return 0;
+
+    while (pos < n && total < max_out) {
+        int off = 0, len = 0;
+        int32_t special_id = -1;
+        if (find_next_special_token(tok, data + pos, n - pos, &off, &special_id, &len)) {
+            if (off > 0) {
+                if (tok->pre_name && strcmp(tok->pre_name, "qwen35") == 0) {
+                    total += encode_qwen35_raw(tok, data + pos, off, out + total, max_out - total);
+                } else {
+                    total += encode_basic_raw(tok, data + pos, off, out + total, max_out - total);
+                }
+            }
+            if (total < max_out) out[total++] = special_id;
+            pos += off + len;
+        } else {
+            if (tok->pre_name && strcmp(tok->pre_name, "qwen35") == 0) {
+                total += encode_qwen35_raw(tok, data + pos, n - pos, out + total, max_out - total);
+            } else {
+                total += encode_basic_raw(tok, data + pos, n - pos, out + total, max_out - total);
+            }
+            break;
         }
     }
 

@@ -249,9 +249,15 @@ static float fp16_to_f32_host(uint16_t h)
     uint32_t exponent = (h >> 10) & 0x1F;
     uint32_t mantissa = h & 0x03FF;
     uint32_t bits;
-    if      (exponent == 0)  bits = sign;
-    else if (exponent == 31) bits = sign | 0x7F800000u | (mantissa << 13);
-    else                     bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+    if (exponent == 0) {
+        /* zero or subnormal fp16: value = ±mantissa × 2^(-24) */
+        float val = (float)mantissa * (1.0f / 16777216.0f);
+        return (h >> 15) ? -val : val;
+    } else if (exponent == 31) {
+        bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+    }
     float f;
     memcpy(&f, &bits, 4);
     return f;
@@ -547,6 +553,72 @@ static int ssm_k_head_for_v_head(int vh, int num_k_heads, int num_v_heads)
     return vh % num_k_heads;
 }
 
+static void cpu_repeat_heads(float *dst,
+                             const float *src,
+                             int src_heads,
+                             int dst_heads,
+                             int head_dim)
+{
+    if (src_heads <= 0 || dst_heads <= 0 || head_dim <= 0) return;
+    if (src_heads == dst_heads) {
+        memcpy(dst, src, (size_t)dst_heads * head_dim * sizeof(float));
+        return;
+    }
+    for (int h = 0; h < dst_heads; h++) {
+        const float *src_h = src + (size_t)(h % src_heads) * head_dim;
+        memcpy(dst + (size_t)h * head_dim, src_h, (size_t)head_dim * sizeof(float));
+    }
+}
+
+static void cpu_delta_net_autoregressive_step(const float *q,
+                                              const float *k,
+                                              const float *v,
+                                              float gate,
+                                              float beta,
+                                              float *state,
+                                              float *out,
+                                              int value_dim,
+                                              int key_dim,
+                                              float *sk_buf,
+                                              float *d_buf)
+{
+    float decay = expf(gate);
+
+    for (int vi = 0; vi < value_dim; vi++) {
+        float *row = state + (size_t)vi * key_dim;
+        for (int ki = 0; ki < key_dim; ki++) {
+            row[ki] *= decay;
+        }
+    }
+
+    for (int vi = 0; vi < value_dim; vi++) {
+        const float *row = state + (size_t)vi * key_dim;
+        float sk = 0.0f;
+        for (int ki = 0; ki < key_dim; ki++) {
+            sk += row[ki] * k[ki];
+        }
+        sk_buf[vi] = sk;
+        d_buf[vi] = (v[vi] - sk) * beta;
+    }
+
+    for (int vi = 0; vi < value_dim; vi++) {
+        float *row = state + (size_t)vi * key_dim;
+        float d = d_buf[vi];
+        for (int ki = 0; ki < key_dim; ki++) {
+            row[ki] += k[ki] * d;
+        }
+    }
+
+    for (int vi = 0; vi < value_dim; vi++) {
+        const float *row = state + (size_t)vi * key_dim;
+        float acc = 0.0f;
+        for (int ki = 0; ki < key_dim; ki++) {
+            acc += row[ki] * q[ki];
+        }
+        out[vi] = acc;
+    }
+}
+
 static void trace_vec_stats(const char *label, const float *x, int n, int max_show)
 {
     float min_v = 1e30f, max_v = -1e30f, sum_sq = 0.0f;
@@ -564,17 +636,78 @@ static void trace_vec_stats(const char *label, const float *x, int n, int max_sh
     fprintf(stderr, "\n");
 }
 
-static void apply_rotary_emb(float *q, float *k, int pos, float rope_freq_base,
-                             int num_q_heads, int num_kv_heads,
-                             int head_dim, int rotary_dim)
+static void trace_sigmoid_stats(const char *label, const float *x, int n, int max_show)
+{
+    float min_v = 1e30f, max_v = -1e30f, sum_sq = 0.0f;
+    fprintf(stderr, "TRACE %s: n=%d", label, n);
+    for (int i = 0; i < n; i++) {
+        float v = cpu_sigmoid(x[i]);
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        sum_sq += v * v;
+    }
+    fprintf(stderr, " rms=%.6f min=%.6f max=%.6f first=", sqrtf(sum_sq / (float)n), min_v, max_v);
+    for (int i = 0; i < n && i < max_show; i++) {
+        fprintf(stderr, "%s%.6f", i ? "," : "", cpu_sigmoid(x[i]));
+    }
+    fprintf(stderr, "\n");
+}
+
+static int rope_select_stream_for_pair(const bread_model_config_t *cfg, int pair_idx, int total_pairs)
+{
+    const int *sections = cfg->rope_sections;
+    const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+
+    if (sect_dims <= 0 || total_pairs <= 0) {
+        return 0;
+    }
+
+    const int sector = pair_idx % sect_dims;
+
+    if (cfg->rope_mrope_interleaved) {
+        if ((sector % 3) == 1 && sector < 3 * sections[1]) {
+            return 1;
+        } else if ((sector % 3) == 2 && sector < 3 * sections[2]) {
+            return 2;
+        } else if ((sector % 3) == 0 && sector < 3 * sections[0]) {
+            return 0;
+        }
+        return 3;
+    }
+
+    {
+        const int sec_w = sections[0] + sections[1];
+        const int sec_e = sec_w + sections[2];
+        if (sector >= sections[0] && sector < sec_w) {
+            return 1;
+        } else if (sector >= sec_w && sector < sec_e) {
+            return 2;
+        } else if (sector >= sec_e) {
+            return 3;
+        }
+    }
+
+    return 0;
+}
+
+static void apply_rotary_emb(const bread_model_config_t *cfg,
+                             float *q, float *k, int pos)
 {
     if (bread_get_disable_rope()) return;
-    int half = rotary_dim / 2;
+    const int rotary_dim = cfg->head_dim_rope;
+    const int half = rotary_dim / 2;
+    const int num_q_heads = cfg->num_q_heads;
+    const int num_kv_heads = cfg->num_kv_heads;
+    const int head_dim = cfg->head_dim_qk;
+    const float rope_freq_base = cfg->rope_freq_base;
+    const float pos_streams[4] = { (float) pos, (float) pos, (float) pos, 0.0f };
+
     for (int h = 0; h < num_q_heads; h++) {
         float *qh = q + h * head_dim;
         for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(rope_freq_base, (float)(2 * i) / rotary_dim);
-            float angle = (float)pos * freq;
+            const int stream = rope_select_stream_for_pair(cfg, i, half);
+            const float freq = 1.0f / powf(rope_freq_base, (float)(2 * i) / rotary_dim);
+            const float angle = pos_streams[stream] * freq;
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
             float q0 = qh[i];
@@ -586,8 +719,9 @@ static void apply_rotary_emb(float *q, float *k, int pos, float rope_freq_base,
     for (int h = 0; h < num_kv_heads; h++) {
         float *kh = k + h * head_dim;
         for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(rope_freq_base, (float)(2 * i) / rotary_dim);
-            float angle = (float)pos * freq;
+            const int stream = rope_select_stream_for_pair(cfg, i, half);
+            const float freq = 1.0f / powf(rope_freq_base, (float)(2 * i) / rotary_dim);
+            const float angle = pos_streams[stream] * freq;
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
             float k0 = kh[i];
@@ -729,6 +863,10 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     static float *h_conv_out = NULL;
     static float *h_attn_out = NULL;
     static float *h_head_tmp = NULL;
+    static float *h_ssm_qrep = NULL;
+    static float *h_ssm_krep = NULL;
+    static float *h_ssm_sk   = NULL;
+    static float *h_ssm_d    = NULL;
     static float *h_q_full   = NULL;
     static float *h_kv_k     = NULL;
     static float *h_kv_v     = NULL;
@@ -780,6 +918,10 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         h_conv_out = (float *)malloc(cfg->ssm_qkv_dim * sizeof(float));
         h_attn_out = (float *)malloc(cfg->attn_out_dim * sizeof(float));
         h_head_tmp = (float *)malloc(cfg->ssm_head_dim * sizeof(float));
+        h_ssm_qrep = (float *)malloc((size_t)cfg->ssm_num_v_heads * cfg->ssm_head_dim * sizeof(float));
+        h_ssm_krep = (float *)malloc((size_t)cfg->ssm_num_v_heads * cfg->ssm_head_dim * sizeof(float));
+        h_ssm_sk   = (float *)malloc(cfg->ssm_head_dim * sizeof(float));
+        h_ssm_d    = (float *)malloc(cfg->ssm_head_dim * sizeof(float));
         h_q_full   = (float *)malloc(cfg->q_proj_dim * sizeof(float));
         h_kv_k     = (float *)malloc(cfg->kv_proj_dim * sizeof(float));
         h_kv_v     = (float *)malloc(cfg->kv_proj_dim * sizeof(float));
@@ -798,7 +940,8 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         h_eo_cpu   = (float *)malloc(H * sizeof(float));
         h_hidden_half = (half *)malloc(H * sizeof(half));
         if (!h_qkv || !h_z || !h_alpha || !h_beta || !h_conv_out || !h_attn_out ||
-            !h_head_tmp || !h_q_full || !h_kv_k || !h_kv_v || !h_q_score || !h_q_gate || !h_scores ||
+            !h_head_tmp || !h_ssm_qrep || !h_ssm_krep || !h_ssm_sk || !h_ssm_d ||
+            !h_q_full || !h_kv_k || !h_kv_v || !h_q_score || !h_q_gate || !h_scores ||
             !h_hidden || !h_normed || !h_normed2 || !h_o_cpu || !h_sg_cpu || !h_su_cpu ||
             !h_sh_cpu || !h_eg_cpu || !h_eu_cpu || !h_eo_cpu || !h_hidden_half) {
             fprintf(stderr, "one_layer_forward: host scratch alloc failed\n");
@@ -844,6 +987,9 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         if (is_full) {
             int heads_per_kv = cfg->num_q_heads / cfg->num_kv_heads;
             int kv_len;
+            const int attn_trace = bread_get_trace_debug() &&
+                                   bread_get_trace_pos() == pos &&
+                                   layer_idx == 3;
 
             snprintf(nm, sizeof(nm), "blk.%d.attn_q.weight", layer_idx);
             cpu_named_matvec(L, g, nm, h_normed, h_q_full, cfg->q_proj_dim, H);
@@ -861,9 +1007,15 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             apply_per_head_rms_norm(h_kv_k, tensor_ram_f32(L, g, nm),
                                     cfg->num_kv_heads, cfg->head_dim_qk, cfg->rms_eps);
 
-            apply_rotary_emb(h_q_score, h_kv_k, pos, cfg->rope_freq_base,
-                             cfg->num_q_heads, cfg->num_kv_heads,
-                             cfg->head_dim_qk, cfg->head_dim_rope);
+            apply_rotary_emb(cfg, h_q_score, h_kv_k, pos);
+
+            if (attn_trace) {
+                trace_vec_stats("bread.layer3.q_score_head0", h_q_score, cfg->head_dim_qk, 8);
+                trace_vec_stats("bread.layer3.k_head0", h_kv_k, cfg->head_dim_qk, 8);
+                trace_vec_stats("bread.layer3.v_head0", h_kv_v, cfg->head_dim_v, 8);
+                trace_vec_stats("bread.layer3.q_gate_raw_head0", h_q_gate, cfg->head_dim_v, 8);
+                trace_sigmoid_stats("bread.layer3.q_gate_sigmoid_head0", h_q_gate, cfg->head_dim_v, 8);
+            }
 
             if (kv_cache_len[layer_idx] >= cfg->kv_cache_len) {
                 fprintf(stderr, "one_layer_forward: KV cache full at layer %d\n", layer_idx);
@@ -889,17 +1041,36 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                     h_scores[p] = dot / sqrtf((float)cfg->head_dim_qk);
                 }
                 cpu_softmax(h_scores, kv_len);
+                if (attn_trace && h == 0) {
+                    trace_vec_stats("bread.layer3.head0.attn_scores_softmax", h_scores, kv_len, 8);
+                    trace_vec_stats("bread.layer3.head0.v_cache_current", kv_v_cache[layer_idx] + (size_t)(kv_len - 1) * cfg->kv_proj_dim + kv_h * cfg->head_dim_v,
+                                    cfg->head_dim_v, 8);
+                }
                 for (int p = 0; p < kv_len; p++) {
                     float *vp = kv_v_cache[layer_idx] + (size_t)p * cfg->kv_proj_dim + kv_h * cfg->head_dim_v;
                     for (int d = 0; d < cfg->head_dim_v; d++) oh[d] += h_scores[p] * vp[d];
                 }
+                if (attn_trace && h == 0) {
+                    memcpy(h_head_tmp, oh, cfg->head_dim_v * sizeof(float));
+                    trace_vec_stats("bread.layer3.head0.attn_pre_gate", h_head_tmp, cfg->head_dim_v, 8);
+                }
                 for (int d = 0; d < cfg->head_dim_v; d++) {
                     oh[d] *= cpu_sigmoid(h_q_gate[h * cfg->head_dim_v + d]);
                 }
+                if (attn_trace && h == 0) {
+                    trace_vec_stats("bread.layer3.head0.attn_post_gate", oh, cfg->head_dim_v, 8);
+                }
+            }
+
+            if (attn_trace) {
+                trace_vec_stats("bread.layer3.attn_out_all_heads_post_gate", h_attn_out, cfg->attn_out_dim, 8);
             }
 
             snprintf(nm, sizeof(nm), "blk.%d.attn_output.weight", layer_idx);
             cpu_named_matvec(L, g, nm, h_attn_out, h_o_cpu, H, cfg->attn_out_dim);
+            if (attn_trace) {
+                trace_vec_stats("bread.layer3.o_proj_out", h_o_cpu, H, 8);
+            }
             g_last_branch_rms = cpu_rms_f32(h_o_cpu, H);
         } else {
             const float *conv_w;
@@ -965,21 +1136,22 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                     float *kh = lin_k + h * key_dim;
                     cpu_l2_norm_bare(kh, key_dim, cfg->rms_eps);
                 }
+                cpu_repeat_heads(h_ssm_qrep, lin_q, num_k_heads, num_v_heads, key_dim);
+                cpu_repeat_heads(h_ssm_krep, lin_k, num_k_heads, num_v_heads, key_dim);
                 if (ssm_trace) {
-                    trace_vec_stats("bread.layer0.q_conv_norm_head0", lin_q, key_dim, 8);
-                    trace_vec_stats("bread.layer0.k_conv_norm_head0", lin_k, key_dim, 8);
+                    trace_vec_stats("bread.layer0.q_conv_norm_head0", h_ssm_qrep, key_dim, 8);
+                    trace_vec_stats("bread.layer0.k_conv_norm_head0", h_ssm_krep, key_dim, 8);
                     trace_vec_stats("bread.layer0.v_conv_head0", lin_v, value_dim, 8);
                 }
 
                 memset(h_attn_out, 0, cfg->ssm_z_dim * sizeof(float));
                 for (int vh = 0; vh < num_v_heads; vh++) {
-                    int kh = ssm_k_head_for_v_head(vh, num_k_heads, num_v_heads);
                     float gate = cpu_softplus(h_alpha[vh] + ssm_dt[vh]) * ssm_a[vh];
                     float decay = expf(gate);
                     float beta_gate = cpu_sigmoid(h_beta[vh]);
                     float *S = layer_state + (size_t)vh * value_dim * key_dim;
-                    float *q_h = lin_q + kh * key_dim;
-                    float *k_h = lin_k + kh * key_dim;
+                    float *q_h = h_ssm_qrep + (size_t)vh * key_dim;
+                    float *k_h = h_ssm_krep + (size_t)vh * key_dim;
                     float *v_h = lin_v + vh * value_dim;
                     float *o_h = h_attn_out + vh * value_dim;
 
@@ -996,25 +1168,10 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                         trace_vec_stats("bread.layer0.vh0.beta", beta_buf, 1, 1);
                     }
 
-                    for (int vi = 0; vi < value_dim; vi++) {
-                        float *row = S + (size_t)vi * key_dim;
-                        for (int ki = 0; ki < key_dim; ki++) row[ki] *= decay;
-                    }
-                    for (int vi = 0; vi < value_dim; vi++) {
-                        float *row = S + (size_t)vi * key_dim;
-                        float kv_mem = 0.0f;
-                        for (int ki = 0; ki < key_dim; ki++) kv_mem += row[ki] * k_h[ki];
-                        {
-                            float delta = (v_h[vi] - kv_mem) * beta_gate;
-                            for (int ki = 0; ki < key_dim; ki++) row[ki] += delta * k_h[ki];
-                        }
-                    }
-                    for (int vi = 0; vi < value_dim; vi++) {
-                        float *row = S + (size_t)vi * key_dim;
-                        float out = 0.0f;
-                        for (int ki = 0; ki < key_dim; ki++) out += row[ki] * q_h[ki];
-                        h_head_tmp[vi] = out;
-                    }
+                    cpu_delta_net_autoregressive_step(
+                        q_h, k_h, v_h, gate, beta_gate,
+                        S, h_head_tmp, value_dim, key_dim,
+                        h_ssm_sk, h_ssm_d);
                     if (ssm_trace && vh == 0) {
                         trace_vec_stats("bread.layer0.vh0.state_after_row0", S, key_dim, 8);
                         trace_vec_stats("bread.layer0.vh0.readout_pre_norm", h_head_tmp, value_dim, 8);
@@ -1186,9 +1343,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         apply_per_head_rms_norm(h_kv_k, k_norm_w,
                                 cfg->num_kv_heads, cfg->head_dim_qk, cfg->rms_eps);
 
-        apply_rotary_emb(h_q_score, h_kv_k, pos, cfg->rope_freq_base,
-                         cfg->num_q_heads, cfg->num_kv_heads,
-                         cfg->head_dim_qk, cfg->head_dim_rope);
+        apply_rotary_emb(cfg, h_q_score, h_kv_k, pos);
 
         if (kv_cache_len[layer_idx] >= cfg->kv_cache_len) {
             fprintf(stderr, "one_layer_forward: KV cache full at layer %d\n", layer_idx);
@@ -1316,44 +1471,22 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                 float *kh = lin_k + h * key_dim;
                 cpu_l2_norm_bare(kh, key_dim, cfg->rms_eps);
             }
+            cpu_repeat_heads(h_ssm_qrep, lin_q, num_k_heads, num_v_heads, key_dim);
+            cpu_repeat_heads(h_ssm_krep, lin_k, num_k_heads, num_v_heads, key_dim);
 
             for (int vh = 0; vh < num_v_heads; vh++) {
-                int kh = ssm_k_head_for_v_head(vh, num_k_heads, num_v_heads);
                 float gate = cpu_softplus(h_alpha[vh] + ssm_dt[vh]) * ssm_a[vh];
-                float decay = expf(gate);
                 float beta_gate = cpu_sigmoid(h_beta[vh]);
                 float *S = layer_state + (size_t)vh * value_dim * key_dim;
-                float *q_h = lin_q + kh * key_dim;
-                float *k_h = lin_k + kh * key_dim;
+                float *q_h = h_ssm_qrep + (size_t)vh * key_dim;
+                float *k_h = h_ssm_krep + (size_t)vh * key_dim;
                 float *v_h = lin_v + vh * value_dim;
                 float *o_h = h_attn_out + vh * value_dim;
 
-                for (int vi = 0; vi < value_dim; vi++) {
-                    float *row = S + (size_t)vi * key_dim;
-                    for (int ki = 0; ki < key_dim; ki++)
-                        row[ki] *= decay;
-                }
-
-                for (int vi = 0; vi < value_dim; vi++) {
-                    float *row = S + (size_t)vi * key_dim;
-                    float kv_mem = 0.0f;
-                    for (int ki = 0; ki < key_dim; ki++)
-                        kv_mem += row[ki] * k_h[ki];
-
-                    {
-                        float delta = (v_h[vi] - kv_mem) * beta_gate;
-                        for (int ki = 0; ki < key_dim; ki++)
-                            row[ki] += delta * k_h[ki];
-                    }
-                }
-
-                for (int vi = 0; vi < value_dim; vi++) {
-                    float *row = S + (size_t)vi * key_dim;
-                    float out = 0.0f;
-                    for (int ki = 0; ki < key_dim; ki++)
-                        out += row[ki] * q_h[ki];
-                    h_head_tmp[vi] = out;
-                }
+                cpu_delta_net_autoregressive_step(
+                    q_h, k_h, v_h, gate, beta_gate,
+                    S, h_head_tmp, value_dim, key_dim,
+                    h_ssm_sk, h_ssm_d);
 
                 cpu_gated_rms_norm(h_head_tmp, h_z + vh * value_dim,
                                    ssm_norm_w, o_h, value_dim, cfg->rms_eps);
