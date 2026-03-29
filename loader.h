@@ -77,6 +77,13 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
+    /* Expert weights — gate, up, down per expert (256 experts per layer) */
+    void **gate_ptrs;           /* [256] VRAM pointers to gate_exps[expert_idx] */
+    void **up_ptrs;             /* [256] VRAM pointers to up_exps[expert_idx] */
+    void **down_ptrs;           /* [256] VRAM pointers to down_exps[expert_idx] */
+} expert_weights_layer_t;
+
+typedef struct {
     /* Common tensors — all 40 layers */
     void *attn_norm_w;          /* F32  — blk.N.attn_norm.weight           */
     void *post_attn_norm_w;     /* F32  — blk.N.post_attention_norm.weight */
@@ -96,6 +103,9 @@ typedef struct {
     void *ssm_alpha_w;          /* Q4_K — blk.N.ssm_alpha.weight           */
     void *ssm_beta_w;           /* Q4_K — blk.N.ssm_beta.weight            */
     void *ssm_out_w;            /* Q4_K — blk.N.ssm_out.weight             */
+
+    /* Expert weights for this layer */
+    expert_weights_layer_t experts;
 } wc_layer_t;
 
 typedef struct {
@@ -178,6 +188,12 @@ int loader_selftest(const char *model_path);
 weight_cache_t *weight_cache_init(const loader_t *L, const gguf_ctx_t *g,
                                   int num_layers,
                                   int (*is_full_attn_fn)(int layer_idx));
+
+/* Load all expert weights from all layers into VRAM.
+ * Call this after weight_cache_init() to cache expert weights.
+ * Returns 0 on success, 1 on failure. */
+int weight_cache_load_experts(weight_cache_t *wc, const loader_t *L,
+                              int num_layers);
 
 /* Free all VRAM allocations in the weight cache and the struct itself. */
 void weight_cache_free(weight_cache_t *wc);

@@ -423,6 +423,13 @@ int main(int argc, char **argv)
                                            bread_layer_is_full_attention);
     if (!wc) { fprintf(stderr, "weight_cache_init failed\n"); return 1; }
 
+    /* -- Pre-load all expert weights to VRAM cache ------------------- */
+    printf("      Loading expert weights to VRAM...\n");
+    if (weight_cache_load_experts(wc, L, cfg->num_layers) != 0) {
+        fprintf(stderr, "weight_cache_load_experts failed\n");
+        return 1;
+    }
+
     /* -- Load tokenizer --------------------------------------------- */
     printf("[2/4] Loading tokenizer...\n");
     tokenizer_t *tok = tokenizer_load(model_path);

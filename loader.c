@@ -622,6 +622,76 @@ weight_cache_t *weight_cache_init(const loader_t *L, const gguf_ctx_t *g,
     return wc;
 }
 
+/* Load all expert weights from all layers into VRAM.
+ * Call this after weight_cache_init() to cache expert weights.
+ * Returns 0 on success, 1 on failure. */
+int weight_cache_load_experts(weight_cache_t *wc, const loader_t *L,
+                              int num_layers)
+{
+    if (!wc || !L) return 1;
+
+    uint64_t expert_bytes = 0;
+    fprintf(stderr, "weight_cache: loading expert weights to VRAM...\n");
+
+    for (int layer = 0; layer < num_layers; layer++) {
+        wc_layer_t *wcl = &wc->layers[layer];
+        const loader_layer_info_t *li = &L->layers[layer];
+
+        if (!li->valid) {
+            wcl->experts.gate_ptrs = NULL;
+            wcl->experts.up_ptrs = NULL;
+            wcl->experts.down_ptrs = NULL;
+            continue;
+        }
+
+        /* Allocate arrays to hold 256 expert pointers */
+        wcl->experts.gate_ptrs = (void **)malloc(256 * sizeof(void *));
+        wcl->experts.up_ptrs   = (void **)malloc(256 * sizeof(void *));
+        wcl->experts.down_ptrs = (void **)malloc(256 * sizeof(void *));
+
+        if (!wcl->experts.gate_ptrs || !wcl->experts.up_ptrs || !wcl->experts.down_ptrs) {
+            fprintf(stderr, "weight_cache_load_experts: malloc failed for layer %d\n", layer);
+            return 1;
+        }
+
+        /* Load each of the 256 experts for this layer */
+        for (int e = 0; e < 256; e++) {
+            uint8_t *gate_src = li->gate_base + e * li->gate_expert_bytes;
+            uint8_t *up_src   = li->up_base   + e * li->up_expert_bytes;
+            uint8_t *down_src = li->down_base + e * li->down_expert_bytes;
+
+            /* Allocate and copy gate weights */
+            void *d_gate = NULL;
+            CUDA_CHECK(cudaMalloc(&d_gate, li->gate_expert_bytes));
+            CUDA_CHECK(cudaMemcpy(d_gate, gate_src, li->gate_expert_bytes,
+                                  cudaMemcpyHostToDevice));
+            wcl->experts.gate_ptrs[e] = d_gate;
+
+            /* Allocate and copy up weights */
+            void *d_up = NULL;
+            CUDA_CHECK(cudaMalloc(&d_up, li->up_expert_bytes));
+            CUDA_CHECK(cudaMemcpy(d_up, up_src, li->up_expert_bytes,
+                                  cudaMemcpyHostToDevice));
+            wcl->experts.up_ptrs[e] = d_up;
+
+            /* Allocate and copy down weights */
+            void *d_down = NULL;
+            CUDA_CHECK(cudaMalloc(&d_down, li->down_expert_bytes));
+            CUDA_CHECK(cudaMemcpy(d_down, down_src, li->down_expert_bytes,
+                                  cudaMemcpyHostToDevice));
+            wcl->experts.down_ptrs[e] = d_down;
+
+            expert_bytes += li->gate_expert_bytes + li->up_expert_bytes + li->down_expert_bytes;
+        }
+    }
+
+    wc->total_bytes += expert_bytes;
+    fprintf(stderr, "weight_cache: loaded experts, total VRAM: %.1f MiB\n",
+            wc->total_bytes / (1024.0 * 1024.0));
+
+    return 0;
+}
+
 /* Free all VRAM allocations in the weight cache. */
 void weight_cache_free(weight_cache_t *wc)
 {
@@ -646,6 +716,29 @@ void weight_cache_free(weight_cache_t *wc)
         if (wcl->ssm_alpha_w)       CUDA_CHECK(cudaFree(wcl->ssm_alpha_w));
         if (wcl->ssm_beta_w)        CUDA_CHECK(cudaFree(wcl->ssm_beta_w));
         if (wcl->ssm_out_w)         CUDA_CHECK(cudaFree(wcl->ssm_out_w));
+
+        /* Free expert weights */
+        if (wcl->experts.gate_ptrs) {
+            for (int e = 0; e < 256; e++) {
+                if (wcl->experts.gate_ptrs[e])
+                    CUDA_CHECK(cudaFree(wcl->experts.gate_ptrs[e]));
+            }
+            free(wcl->experts.gate_ptrs);
+        }
+        if (wcl->experts.up_ptrs) {
+            for (int e = 0; e < 256; e++) {
+                if (wcl->experts.up_ptrs[e])
+                    CUDA_CHECK(cudaFree(wcl->experts.up_ptrs[e]));
+            }
+            free(wcl->experts.up_ptrs);
+        }
+        if (wcl->experts.down_ptrs) {
+            for (int e = 0; e < 256; e++) {
+                if (wcl->experts.down_ptrs[e])
+                    CUDA_CHECK(cudaFree(wcl->experts.down_ptrs[e]));
+            }
+            free(wcl->experts.down_ptrs);
+        }
     }
 
     free(wc);

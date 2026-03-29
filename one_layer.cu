@@ -1664,17 +1664,8 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     if (!wc) { cudaFree(d_sg_w); cudaFree(d_su_w); }
 
     /* ================================================================
-     * DMA: Stream B — load K expert weight sets into VRAM
-     * Fire DMA immediately, then overlap with shared SwiGLU+down on stream_a
-     * ================================================================ */
-    if (!bread_get_boring_mode()) {
-        loader_request(L, layer_idx, expert_indices, cfg->top_k);
-        /* NOTE: no loader_sync here — DMA runs in background while we do shared down */
-    }
-
-    /* ================================================================
      * CMD3a: shared expert SwiGLU + down projection → accumulate
-     * Overlaps with DMA (loader_request already fired above)
+     * All expert weights are pre-cached in VRAM, so no DMA needed
      * ================================================================ */
     {
         int n_blocks_si = (cfg->shared_inter + 255) / 256;
@@ -1702,66 +1693,45 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         }
     }
 
-    /* Now wait for DMA to complete before accessing expert VRAM */
-    if (!bread_get_boring_mode()) {
-        loader_sync(L);
-    }
-
     /* ================================================================
      * CMD3b: K active expert forwards → weighted accumulate into hidden
+     * All expert weights are pre-cached in wc->layers[layer_idx].experts
      * ================================================================ */
     {
         int n_blocks_ei = (cfg->expert_inter + 255) / 256;
         int n_blocks_h  = (H + 255) / 256;
 
         for (int k = 0; k < cfg->top_k; k++) {
-            expert_ptrs_t ep;
-            void *tmp_gate = NULL;
-            void *tmp_up = NULL;
-            void *tmp_down = NULL;
-            memset(&ep, 0, sizeof(ep));
+            int expert_idx = expert_indices[k];
 
-            if (bread_get_boring_mode()) {
-                snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_exps.weight", layer_idx);
-                tmp_gate = load_expert_tensor_vram(L, g, nm, expert_indices[k], &ep.gate_type);
-                snprintf(nm, sizeof(nm), "blk.%d.ffn_up_exps.weight", layer_idx);
-                tmp_up = load_expert_tensor_vram(L, g, nm, expert_indices[k], &ep.up_type);
-                snprintf(nm, sizeof(nm), "blk.%d.ffn_down_exps.weight", layer_idx);
-                tmp_down = load_expert_tensor_vram(L, g, nm, expert_indices[k], &ep.down_type);
-                ep.gate = tmp_gate;
-                ep.up = tmp_up;
-                ep.down = tmp_down;
-            } else {
-                ep = loader_get_expert(L, layer_idx, expert_indices[k]);
-                if (!ep.gate) {
-                    fprintf(stderr, "expert(%d,%d) not in cache after sync\n",
-                            layer_idx, expert_indices[k]);
-                    continue;
-                }
+            /* Retrieve pre-cached expert weights from VRAM */
+            if (!wc || !wc->layers[layer_idx].experts.gate_ptrs) {
+                fprintf(stderr, "ERROR: expert weights not cached (wc=%p)\n", wc);
+                continue;
             }
 
+            void *d_gate = wc->layers[layer_idx].experts.gate_ptrs[expert_idx];
+            void *d_up   = wc->layers[layer_idx].experts.up_ptrs[expert_idx];
+            void *d_down = wc->layers[layer_idx].experts.down_ptrs[expert_idx];
+
             /* gate/up projections: normed2[H] → gate/up[EXPERT_INTER] */
-            bread_matvec(ep.gate, d_normed2, d_eg,
-                         cfg->expert_inter, H, (int)ep.gate_type, stream_a);
-            bread_matvec(ep.up,  d_normed2, d_eu,
-                         cfg->expert_inter, H, (int)ep.up_type, stream_a);
+            bread_matvec(d_gate, d_normed2, d_eg,
+                         cfg->expert_inter, H, GGML_TYPE_Q4_K, stream_a);
+            bread_matvec(d_up,  d_normed2, d_eu,
+                         cfg->expert_inter, H, GGML_TYPE_Q4_K, stream_a);
 
             /* SwiGLU in-place on gate */
             silu_mul_inplace<<<n_blocks_ei, 256, 0, stream_a>>>(
                 d_eg, d_eu, cfg->expert_inter);
 
             /* down projection: gate[EXPERT_INTER] → expert_out[H] */
-            bread_matvec(ep.down, d_eg, d_eo,
-                         H, cfg->expert_inter, (int)ep.down_type, stream_a);
+            bread_matvec(d_down, d_eg, d_eo,
+                         H, cfg->expert_inter, GGML_TYPE_Q6_K, stream_a);
 
             /* Weighted accumulate into hidden */
             scale_accum<<<n_blocks_h, 256, 0, stream_a>>>(
                 d_hidden, d_eo, expert_weights[k], H);
             /* No intermediate syncs — all on same stream, GPU handles ordering */
-
-            if (tmp_gate) cudaFree(tmp_gate);
-            if (tmp_up) cudaFree(tmp_up);
-            if (tmp_down) cudaFree(tmp_down);
         }
         /* Flush all expert kernels to GPU (single sync instead of per-expert) */
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
