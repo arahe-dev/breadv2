@@ -129,8 +129,9 @@ typedef struct {
     uint64_t hits;
     uint64_t misses;
 
-    /* CUDA stream for async DMA */
-    cudaStream_t stream_b;
+    /* CUDA streams for async DMA (dual-stream for prefetch overlap) */
+    cudaStream_t stream_b;  /* current layer expert loading */
+    cudaStream_t stream_c;  /* next layer expert prefetch */
 } loader_t;
 
 /* ------------------------------------------------------------------ */
@@ -148,10 +149,16 @@ loader_t *loader_init(const char *model_path);
 /* Shut down: free pinned RAM, VRAM slots, CUDA stream. */
 void loader_free(loader_t *L);
 
-/* Kick off async DMA for K experts. Cache hits skip DMA.
+/* Kick off async DMA for K experts on stream_b. Cache hits skip DMA.
  * Returns immediately — call loader_sync() before using results. */
 void loader_request(loader_t *L, int layer_idx,
                     const int *expert_indices, int K);
+
+/* Kick off async DMA for K experts on specified stream. Cache hits skip DMA.
+ * For dual-stream prefetching: use stream_c for layer N+1 while layer N runs. */
+void loader_request_on_stream(loader_t *L, int layer_idx,
+                              const int *expert_indices, int K,
+                              cudaStream_t stream);
 
 /* Block until all pending DMA from loader_request has completed. */
 void loader_sync(loader_t *L);

@@ -282,8 +282,9 @@ loader_t *loader_init(const char *model_path) {
     L->hits = 0;
     L->misses = 0;
 
-    /* ---- Step 7: Create CUDA stream for async DMA ---- */
+    /* ---- Step 7: Create CUDA streams for async DMA (dual-stream prefetch) ---- */
     CUDA_CHECK(cudaStreamCreate(&L->stream_b));
+    CUDA_CHECK(cudaStreamCreate(&L->stream_c));
 
     gguf_close(ctx);
 
@@ -307,6 +308,7 @@ void loader_free(loader_t *L) {
     fprintf(stderr, "\n");
 
     cudaStreamDestroy(L->stream_b);
+    cudaStreamDestroy(L->stream_c);
     for (int i = 0; i < LOADER_NUM_SLOTS; i++) {
         if (L->vram_slots[i]) cudaFree(L->vram_slots[i]);
     }
@@ -383,11 +385,82 @@ void loader_request(loader_t *L, int layer_idx,
 }
 
 /* ------------------------------------------------------------------ */
+/* loader_request_on_stream — async DMA on specified stream (for      */
+/* dual-stream prefetching: use stream_c for layer N+1 while layer N  */
+/* computes on stream_a and stream_b)                                  */
+/* ------------------------------------------------------------------ */
+
+void loader_request_on_stream(loader_t *L, int layer_idx,
+                              const int *expert_indices, int K,
+                              cudaStream_t stream)
+{
+    if (layer_idx < 0 || layer_idx >= LOADER_MAX_LAYERS ||
+        !L->layers[layer_idx].valid) {
+        fprintf(stderr, "loader_request_on_stream: invalid layer %d\n", layer_idx);
+        return;
+    }
+
+    const loader_layer_info_t *li = &L->layers[layer_idx];
+
+    for (int k = 0; k < K; k++) {
+        int eidx = expert_indices[k];
+        if (eidx < 0 || eidx >= li->num_experts) {
+            fprintf(stderr, "loader_request_on_stream: layer %d expert %d out of range\n",
+                    layer_idx, eidx);
+            continue;
+        }
+
+        int slot = L->entry_idx[layer_idx][eidx];
+        if (slot >= 0) {
+            /* Cache HIT — just update LRU timestamp */
+            L->cache[slot].last_used = ++L->access_counter;
+            L->hits++;
+            continue;
+        }
+
+        /* Cache MISS — find LRU slot, evict, DMA on specified stream */
+        L->misses++;
+        int lru = find_lru_slot(L);
+        evict_slot(L, lru);
+
+        uint8_t *dst = L->vram_slots[lru];
+
+        /* Copy gate weights */
+        uint8_t *src_gate = li->gate_base + (uint64_t)eidx * li->gate_expert_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(dst, src_gate,
+                   (size_t)li->gate_expert_bytes,
+                   cudaMemcpyHostToDevice, stream));
+        dst += li->gate_expert_bytes;
+
+        /* Copy up weights */
+        uint8_t *src_up = li->up_base + (uint64_t)eidx * li->up_expert_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(dst, src_up,
+                   (size_t)li->up_expert_bytes,
+                   cudaMemcpyHostToDevice, stream));
+        dst += li->up_expert_bytes;
+
+        /* Copy down weights */
+        uint8_t *src_down = li->down_base + (uint64_t)eidx * li->down_expert_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(dst, src_down,
+                   (size_t)li->down_expert_bytes,
+                   cudaMemcpyHostToDevice, stream));
+
+        /* Update cache */
+        L->cache[lru].layer_idx  = layer_idx;
+        L->cache[lru].expert_idx = eidx;
+        L->cache[lru].last_used  = ++L->access_counter;
+        L->entry_idx[layer_idx][eidx] = lru;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* loader_sync — block until all pending DMA completes                 */
 /* ------------------------------------------------------------------ */
 
 void loader_sync(loader_t *L) {
+    /* Sync both streams (stream_b for current layer, stream_c for prefetch) */
     CUDA_CHECK(cudaStreamSynchronize(L->stream_b));
+    CUDA_CHECK(cudaStreamSynchronize(L->stream_c));
 }
 
 /* ------------------------------------------------------------------ */
