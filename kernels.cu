@@ -237,6 +237,53 @@ __global__ void dequant_q6k_matvec(
 }
 
 /* ------------------------------------------------------------------ */
+/* Q8_0 matvec kernel                                                   */
+/*                                                                      */
+/* Q8_0 block layout (34 bytes, 32 elements):                          */
+/*   [0..1]  fp16 d  — scale                                           */
+/*   [2..33] int8[32] — quantised values                               */
+/*   value[i] = d * q[i]                                               */
+/* ------------------------------------------------------------------ */
+#define Q8_0_BLOCK_BYTES  34
+#define Q8_0_BLOCK_ELEMS  32
+#define QTYPE_Q8_0        8
+
+__global__ void dequant_q8_0_matvec(
+    const uint8_t * __restrict__ w,
+    const half    * __restrict__ x,
+    half          * __restrict__ y,
+    int rows, int cols)
+{
+    __shared__ float warp_buf[8];
+    int row  = (int)blockIdx.x;
+    if (row >= rows) return;
+    int tid  = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int nblocks = cols / Q8_0_BLOCK_ELEMS;
+
+    float sum = 0.0f;
+    for (int e = tid; e < cols; e += THREADS_PER_ROW) {
+        int b   = e / Q8_0_BLOCK_ELEMS;
+        int pos = e % Q8_0_BLOCK_ELEMS;
+        const uint8_t *blk = w + ((size_t)row * nblocks + b) * Q8_0_BLOCK_BYTES;
+        uint16_t d_raw = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        float d = __half2float(__ushort_as_half(d_raw));
+        int8_t  q = ((const int8_t *)(blk + 2))[pos];
+        sum += d * (float)q * __half2float(x[e]);
+    }
+
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) warp_buf[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < 8) ? warp_buf[lane] : 0.0f;
+        v = warp_reduce_sum(v);
+        if (lane == 0) y[row] = __float2half(v);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Host dispatcher                                                      */
 /* ------------------------------------------------------------------ */
 void bread_matvec(void *w, half *x, half *y, int rows, int cols, int qtype, cudaStream_t stream)
@@ -249,6 +296,9 @@ void bread_matvec(void *w, half *x, half *y, int rows, int cols, int qtype, cuda
             (const uint8_t *)w, x, y, rows, cols);
     } else if (qtype == QTYPE_Q6_K) {
         dequant_q6k_matvec<<<grid, block, 0, stream>>>(
+            (const uint8_t *)w, x, y, rows, cols);
+    } else if (qtype == QTYPE_Q8_0) {
+        dequant_q8_0_matvec<<<grid, block, 0, stream>>>(
             (const uint8_t *)w, x, y, rows, cols);
     } else {
         fprintf(stderr, "bread_matvec: unknown qtype %d\n", qtype);
