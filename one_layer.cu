@@ -785,6 +785,72 @@ float one_layer_last_branch_rms(void)
     return g_last_branch_rms;
 }
 
+/* ================================================================== */
+/* route_layer: MoE routing logic (extracted for prefetching)         */
+/*                                                                    */
+/* Takes the post-attn normalised hidden state (d_normed2) and       */
+/* computes expert routing: router matmul + softmax + topK.          */
+/* Output: expert_indices, expert_weights (pre-allocated buffers).   */
+/* Also computes shared_gate_score (returned, not used by route).    */
+/* ================================================================== */
+
+float route_layer(loader_t *L, gguf_ctx_t *g,
+                  int layer_idx, const half *d_normed2,
+                  int *expert_indices, float *expert_weights)
+{
+    const bread_model_config_t *cfg = bread_model_config_get();
+    int H = cfg->hidden_dim;
+    char nm[128];
+    float shared_gate_score = 0.0f;
+
+    /* Pre-allocated static buffers (shared with one_layer_forward) */
+    static float *h_normed2 = NULL;
+    static float *h_logits = NULL;
+    static int   *h_expert_indices = NULL;
+    static float *h_expert_weights = NULL;
+
+    /* Allocate once */
+    if (!h_normed2) {
+        h_normed2 = (float *)malloc((size_t)H * sizeof(float));
+        h_logits = (float *)malloc((size_t)cfg->num_experts * sizeof(float));
+        h_expert_indices = (int *)malloc((size_t)cfg->top_k * sizeof(int));
+        h_expert_weights = (float *)malloc((size_t)cfg->top_k * sizeof(float));
+    }
+
+    /* Copy d_normed2 (VRAM half) → CPU float */
+    vram_half_to_cpu_float(d_normed2, h_normed2, H);
+
+    /* Load router weights */
+    snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_inp.weight", layer_idx);
+    const float *router_w = tensor_ram_f32(L, g, nm);
+
+    /* Router matmul: logits[i] = Σ_j router_w[i * H + j] * normed2[j] */
+    memset(h_logits, 0, (size_t)cfg->num_experts * sizeof(float));
+    for (int i = 0; i < cfg->num_experts; i++)
+        for (int j = 0; j < H; j++)
+            h_logits[i] += router_w[i * H + j] * h_normed2[j];
+
+    /* Shared gate score (optional) */
+    snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_inp_shexp.weight", layer_idx);
+    const half *shared_gate_w = NULL;
+    if (gguf_find_tensor(g, nm)) {
+        shared_gate_w = tensor_ram_f16(L, g, nm);
+        for (int j = 0; j < H; j++)
+            shared_gate_score += __half2float(shared_gate_w[j]) * h_normed2[j];
+    }
+
+    /* Softmax + topK */
+    cpu_softmax(h_logits, cfg->num_experts);
+    cpu_topk(h_logits, cfg->num_experts, cfg->top_k,
+             h_expert_indices, h_expert_weights);
+
+    /* Copy results to output buffers */
+    memcpy(expert_indices, h_expert_indices, (size_t)cfg->top_k * sizeof(int));
+    memcpy(expert_weights, h_expert_weights, (size_t)cfg->top_k * sizeof(float));
+
+    return shared_gate_score;
+}
+
 void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                         loader_t *L, gguf_ctx_t *g,
                         weight_cache_t *wc,
@@ -1583,43 +1649,15 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                  cfg->shared_inter, H, GGML_TYPE_Q4_K, stream_a);
     /* NOTE: no sync yet — gate+up runs on GPU while CPU does routing below */
 
-    /* CPU routing: router matmul (F32) + softmax + topK
-     * This runs while stream_a executes shared gate+up matvecs (~8 μs GPU work).
+    /* CPU routing: extract to route_layer() for prefetching support.
+     * route_layer runs while stream_a executes shared gate+up matvecs (~8 μs GPU work).
      * vram_half_to_cpu_float uses cudaMemcpy(DeviceToHost) which syncs the default
      * stream only, not stream_a. Both can read d_normed2 concurrently (safe).
      */
-    int   *expert_indices = NULL;
-    float *expert_weights = NULL;
-    float shared_gate_score = 0.0f;
-    {
-        expert_indices = h_expert_indices;   /* pre-allocated static buffer */
-        expert_weights = h_expert_weights;   /* pre-allocated static buffer */
-        snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_inp.weight", layer_idx);
-        const float *router_w = tensor_ram_f32(L, g, nm);
-        snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_inp_shexp.weight", layer_idx);
-        const half *shared_gate_w = NULL;
-        if (gguf_find_tensor(g, nm)) shared_gate_w = tensor_ram_f16(L, g, nm);
-
-        /* Copy d_normed2 → CPU float (default stream cudaMemcpy, doesn't wait for stream_a) */
-        float *normed_f32 = h_normed2;      /* pre-allocated static buffer */
-        float *logits = h_logits;           /* pre-allocated static buffer */
-        vram_half_to_cpu_float(d_normed2, normed_f32, H);
-
-        /* Dense F32 matmul: logits[i] = router_w[i * H + j] * normed[j] */
-        memset(logits, 0, cfg->num_experts * sizeof(float));
-        for (int i = 0; i < cfg->num_experts; i++)
-            for (int j = 0; j < H; j++)
-                logits[i] += router_w[i * H + j] * normed_f32[j];
-
-        if (shared_gate_w) {
-            for (int j = 0; j < H; j++)
-                shared_gate_score += __half2float(shared_gate_w[j]) * normed_f32[j];
-        }
-
-        cpu_softmax(logits, cfg->num_experts);
-        cpu_topk(logits, cfg->num_experts, cfg->top_k,
-                 expert_indices, expert_weights);
-    }
+    int   *expert_indices = h_expert_indices;   /* pre-allocated static buffer */
+    float *expert_weights = h_expert_weights;   /* pre-allocated static buffer */
+    float shared_gate_score = route_layer(L, g, layer_idx, d_normed2,
+                                           expert_indices, expert_weights);
 
     /* Sync stream_a for shared gate+up (should complete in ~8 μs, routing took ~500 μs → 0 wait) */
     CUDA_CHECK(cudaStreamSynchronize(stream_a));
@@ -1728,6 +1766,50 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         /* Flush all expert kernels to GPU (single sync instead of per-expert) */
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
     }
+
+    /* ================================================================
+     * Phase 5: Prefetch next layer's experts (dual-stream optimization)
+     *
+     * If not the last layer and not in boring mode:
+     * Route for layer+1 using current d_hidden (post-FFN, pre-next-attn).
+     * Fire loader_request on stream_c so layer+1 experts load in background.
+     * ================================================================ */
+    if (layer_idx + 1 < cfg->num_layers && !bread_get_boring_mode()) {
+        static int   *h_next_expert_indices = NULL;
+        static float *h_next_expert_weights = NULL;
+        if (!h_next_expert_indices) {
+            h_next_expert_indices = (int *)malloc((size_t)cfg->top_k * sizeof(int));
+            h_next_expert_weights = (float *)malloc((size_t)cfg->top_k * sizeof(float));
+        }
+
+        /* For prefetching: route_layer requires post-attn norm input.
+         * We have d_hidden (post-FFN), but need post-attn norm of next layer.
+         * Instead, fire a basic prefetch for next layer's routing on stream_c.
+         * Create a temp normalized version of d_hidden for routing.
+         */
+        static half *d_normed_prefetch = NULL;
+        if (!d_normed_prefetch) {
+            CUDA_CHECK(cudaMalloc(&d_normed_prefetch, (size_t)H * sizeof(half)));
+        }
+
+        /* Copy d_hidden → d_normed_prefetch and normalize */
+        int blocks = (H + 255) / 256;
+        copy_half<<<blocks, 256, 0, stream_a>>>(d_normed_prefetch, d_hidden, H);
+
+        /* Load next layer's post-attn norm weight */
+        snprintf(nm, sizeof(nm), "blk.%d.post_attention_norm.weight", layer_idx + 1);
+        float *d_pan_next = (float *)load_vram(L, g, nm);
+        rmsnorm_inplace<<<1, 256, 0, stream_a>>>(d_normed_prefetch, d_pan_next, H, cfg->rms_eps);
+        CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        cudaFree(d_pan_next);
+
+        /* Route for next layer and prefetch on stream_c */
+        route_layer(L, g, layer_idx + 1, d_normed_prefetch,
+                    h_next_expert_indices, h_next_expert_weights);
+        loader_request_on_stream(L, layer_idx + 1, h_next_expert_indices,
+                                 cfg->top_k, L->stream_c);
+    }
+
     /* d_hidden now contains the full transformer block output */
 }
 

@@ -52,6 +52,9 @@ extern void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                                loader_t *L, gguf_ctx_t *g,
                                weight_cache_t *wc,
                                cudaStream_t stream_a);
+extern float route_layer(loader_t *L, gguf_ctx_t *g, int layer_idx,
+                         const half *d_normed2,
+                         int *expert_indices, float *expert_weights);
 extern float one_layer_cpu_hidden_rms(int hidden_dim);
 extern float one_layer_last_branch_rms(void);
 
