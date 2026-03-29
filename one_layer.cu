@@ -1770,11 +1770,14 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     /* ================================================================
      * Phase 5: Prefetch next layer's experts (dual-stream optimization)
      *
-     * If not the last layer and not in boring mode:
+     * If prefetch mode enabled, not last layer, and not in boring mode:
      * Route for layer+1 using current d_hidden (post-FFN, pre-next-attn).
      * Fire loader_request on stream_c so layer+1 experts load in background.
+     * Note: prefetch adds ~10ms overhead per layer, beneficial for longer
+     * sequences with more DMA overlap (>100 tokens), hurts short sequences.
      * ================================================================ */
-    if (layer_idx + 1 < cfg->num_layers && !bread_get_boring_mode()) {
+    if (bread_get_prefetch_mode() && layer_idx + 1 < cfg->num_layers &&
+        !bread_get_boring_mode()) {
         static int   *h_next_expert_indices = NULL;
         static float *h_next_expert_weights = NULL;
         if (!h_next_expert_indices) {

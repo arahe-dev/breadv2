@@ -370,6 +370,7 @@ int main(int argc, char **argv)
     int         debug_rms   = 0;
     int         force_ssm_zero = 0;
     int         disable_rope = 0;
+    int         prefetch_mode = 0;
 
     /* -- Parse args ------------------------------------------------- */
     for (int i = 1; i < argc; i++) {
@@ -381,6 +382,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--debug"))   debug_rms = 1;
         else if (!strcmp(argv[i], "--force-ssm-zero")) force_ssm_zero = 1;
         else if (!strcmp(argv[i], "--disable-rope"))   disable_rope = 1;
+        else if (!strcmp(argv[i], "--prefetch")) prefetch_mode = 1;
     }
 
     bread_set_boring_mode(minimal_mode);
@@ -388,6 +390,7 @@ int main(int argc, char **argv)
     bread_set_disable_rope(disable_rope);
     bread_set_trace_debug(debug_rms);
     bread_set_trace_pos(-1);
+    bread_set_prefetch_mode(prefetch_mode);
 
     printf("=== BREAD inference ===\n");
     printf("Prompt   : \"%s\"\n", prompt);

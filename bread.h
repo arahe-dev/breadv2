@@ -134,6 +134,8 @@ void bread_set_trace_debug(int enabled);
 int bread_get_trace_debug(void);
 void bread_set_trace_pos(int pos);
 int bread_get_trace_pos(void);
+void bread_set_prefetch_mode(int enabled);
+int bread_get_prefetch_mode(void);
 
 #ifdef __cplusplus
 }

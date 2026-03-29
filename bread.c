@@ -22,6 +22,7 @@ static int g_force_ssm_zero = 0;
 static int g_disable_rope = 0;
 static int g_trace_debug = 0;
 static int g_trace_pos = -1;
+static int g_prefetch_mode = 0;  /* Layer prefetch optimization (off by default) */
 
 static void xread(FILE *fp, void *buf, size_t n) {
     if (fread(buf, 1, n, fp) != n) {
@@ -371,4 +372,14 @@ void bread_set_trace_pos(int pos)
 int bread_get_trace_pos(void)
 {
     return g_trace_pos;
+}
+
+void bread_set_prefetch_mode(int enabled)
+{
+    g_prefetch_mode = enabled ? 1 : 0;
+}
+
+int bread_get_prefetch_mode(void)
+{
+    return g_prefetch_mode;
 }
