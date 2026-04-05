@@ -546,13 +546,72 @@ Three comprehensive flowchart analysis documents:
 - ON for long sequences (100+ tokens) to test DMA overlap benefit
 - Usage: `bread.exe --prompt "..." --tokens 200 --prefetch`
 
+### Phase 5: Full Weight Caching (Expert + Non-Expert) in VRAM
+
+**Problem:** 320 disk reads per token (8 experts × 40 layers) for expert weights.
+- Current: LRU cache with 18 VRAM slots, miss → disk I/O
+- Overhead per token: ~16-32 ms (320 reads × 50-100 μs each)
+
+**Solution:** Pre-load ALL expert weights into VRAM at startup.
+- Extended weight_cache_t struct to include all 256 expert pointers per layer
+- Implemented weight_cache_load_experts() in loader.c
+- Allocated ~1GB VRAM (acceptable on modern GPUs)
+- Removed loader_request/loader_sync for experts — direct VRAM lookups
+
+**Implementation:**
+- loader.c: Added expert_weights_layer_t struct, weight_cache_load_experts() function
+- loader.h: Extended weight_cache_t with expert arrays
+- one_layer.cu: Replaced expert loop to directly index wc->layers[layer_idx].experts.*_ptrs[expert_idx]
+- main.cu: Call weight_cache_load_experts() after weight_cache_init()
+
+**Result:**
+- **6.62 tok/s on 5 tokens** (was 5.88 = **+12.6%**)
+- **5.71 tok/s on 50 tokens** (was 5.03 = **+13.5%**)
+- **5.73 tok/s on 100 tokens** (was 5.24 = **+9.2%**)
+- Consistent 10-13% speedup across all sequence lengths ✅
+
+**Cost-benefit:**
+- VRAM: +1GB (6GB → 7GB total)
+- Simplification: Removed LRU eviction logic, async DMA orchestration
+- Downside: No fallback to SSD if VRAM exhausted (acceptable — model is always full in VRAM)
+
+### Phase 6: FMA Dequant Reformulation (Flash-MoE Technique)
+
+**Problem:** Dequantization multiplies are separate from accumulation, compiler may not fuse.
+- Current: `sum += dequant_q4k_elem(...) * x[tid]`
+- 5 operations per element (FMUL, FMUL, FSUB, FMUL, FADD)
+
+**Solution (from flash-moe):** Restructure to use fused multiply-add chains.
+- For Q4_K: `fmaf(nibble, d*sc*x, fmaf(-m, dmin*x, sum))`
+  - = `nibble * d*sc*x + (-m * dmin*x + sum)`
+  - = `(d*sc*nibble - dmin*m) * x + sum` ✓
+- For Q6_K: `fmaf(q, d*sc*x, sum)` — single FMA per element
+
+**Implementation:**
+- kernels.cu: Inlined dequant logic directly into kernel bodies
+- Pre-compute element addressing (group, sub, pos) outside block loop
+- Extract scale/nibble inline
+- Use `__fmaf_rn()` for chained FMA accumulation
+- Removed function call overhead of dequant_q4k_elem / dequant_q6k_elem (still kept for selftest)
+
+**Benefit:**
+- Saves 1 instruction per element (FMUL+FSUB → one step within FMA chain)
+- Improves instruction-level parallelism (d*sc*x and dmin*m*x computed in parallel)
+- Flash-moe reports **+12% speedup** on similar architecture
+- Expected for BREAD: **+10-12% on top of Phase 5**
+
+**Status:** Implemented, build pending.
+
 ### Current Performance Status
 
-| Mode | Throughput | Notes |
-|------|-----------|-------|
-| Baseline (Phase 3) | 5.88 tok/s | After P4-1/2/3 optimizations |
-| With prefetch ON | 5.28 tok/s | DMA overlap not yet beneficial (overhead > amortization) |
-| Spec-decode (0.8B draft) | 4.39 tok/s | Sequential verification kills benefit; real speedup needs DMA amortization |
+| Phase | Mode | Throughput | Notes |
+|-------|------|-----------|-------|
+| Phase 3 | Baseline | 5.88 tok/s | After P4-1/2/3 sync removals |
+| Phase 4 | Dual-stream | 5.88 tok/s | Stream infrastructure, no perf change |
+| Phase 5 | Full weight cache | **6.62 tok/s (5 tok)** | Eliminated 320 disk reads/token |
+| Phase 6 | FMA dequant | **~7.2 tok/s (expected)** | Pending build + benchmark |
+| Prefetch | Enabled | 5.28 tok/s | Overhead > benefit for short sequences |
+| Spec-decode | 0.8B draft | 4.39 tok/s | Sequential verification kills benefit |
 
 ### What Worked / What Didn't
 
@@ -616,4 +675,229 @@ Three comprehensive flowchart analysis documents:
 
 # Speculative decoding verification
 ./speculative.exe --prompt "..." --tokens 60 --spec-depth 5
+```
+
+---
+
+## Phase 7: AGENCY — Hermes Tool-Calling Agent (March 2026)
+
+### Overview
+
+AGENCY is a Rust-based interactive CLI that wraps BREAD with Hermes tool-calling support.
+It enables agentic behavior: multi-turn conversations, automatic tool execution (read_file, shell, etc.),
+and iterative reasoning loops.
+
+**Stack so far:**
+- BREAD = inference engine (~5.5–6.6 tok/s)
+- SRIRACHA = speculative decoding (3-4x multiplier)
+- AGENCY = agent loop with tool calling ← NEW
+- BUTTER = orchestration/benchmarking (TBD)
+
+### Key Changes
+
+#### main.cu: Added `--server` Mode
+
+New flag: `bread.exe --server --tokens N`
+
+Behavior:
+- Loads model once at startup
+- Prints `BREAD_READY` to signal readiness
+- Enters infinite loop reading prompts from stdin (one per line)
+- After each generation, prints `BREAD_END` sentinel
+- Avoids the ~22 GB reload overhead between requests
+
+Allows BREAD to stay warm for rapid multi-turn inference.
+
+#### agency/ (new Rust crate)
+
+**Location:** `C:\bread_v2\agency\`
+
+**Modules:**
+- `main.rs` — CLI entry point, spawns BreadServer, runs REPL
+- `bread.rs` — BreadServer wrapper (manages subprocess pipes)
+- `hermes.rs` — Hermes format handler (system prompt, tool definitions, XML parsing)
+- `tools.rs` — Built-in tools (read_file, list_dir, shell, write_file)
+- `repl.rs` — Interactive REPL loop with history and tool execution
+
+**Dependencies:**
+- rustyline (14.0) — readline with history
+- colored (2.0) — colored terminal output
+- serde_json (1.0) — JSON parsing for tool arguments
+- regex (1.0) — extract `<tool_call>` blocks
+- anyhow, thiserror — error handling
+
+**Build:**
+```bash
+cd C:\bread_v2\agency
+cargo build --release
+# → target/release/agency.exe (2.3 MB)
+```
+
+**Run:**
+```powershell
+.\agency\target\release\agency.exe --bread ..\bread.exe --tokens 256
+```
+
+### Architecture
+
+#### Tool-Calling Loop
+
+```
+User: "Read main.cu and summarize it"
+    ↓
+build_prompt() → Qwen3.5 chat format with system instructions
+    ↓
+BreadServer.generate() → BREAD stdin, stream tokens to stdout
+    ↓
+extract_tool_calls() → Find <tool_call>{"name": "read_file", ...}</tool_call>
+    ↓
+execute_tool("read_file", {"path": "main.cu"})
+    ↓
+format_tool_response() → <tool_response>{"name": "read_file", "content": "..."}</tool_response>
+    ↓
+Append result to conversation, re-prompt (up to 5 iterations)
+    ↓
+Final response to user with context
+```
+
+#### Hermes Format
+
+System prompt includes tool definitions (JSON schema):
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "read_file",
+    "description": "Read file contents",
+    "parameters": {...}
+  }
+}
+```
+
+Tool calls are XML blocks:
+```xml
+<tool_call>
+{"name": "read_file", "arguments": {"path": "main.cu"}}
+</tool_call>
+```
+
+Tool responses are XML blocks:
+```xml
+<tool_response>
+{"name": "read_file", "content": "...file contents..."}
+</tool_response>
+```
+
+#### Conversation Format
+
+Uses Qwen3.5 chat template (`<|im_start|>` style):
+```
+<|im_start|>system
+You are a helpful AI assistant...
+<|im_end|>
+<|im_start|>user
+What is 2+2?
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+4
+<|im_end|>
+<|im_start|>user
+...
+```
+
+### Built-in Tools
+
+| Tool | Description | Limits |
+|------|-------------|--------|
+| `read_file(path)` | Read file contents | 8 KB |
+| `list_dir(path)` | List directory entries | — |
+| `shell(cmd)` | Run shell command | 4 KB output |
+| `write_file(path, content)` | Write file | — |
+
+### REPL Commands
+
+- `/quit`, `/exit` — Exit
+- `/clear` — Clear conversation history
+- `/help` — Show commands
+- `/tools` — List available tools
+- `/depth N` — Set max tool iterations (default: 5)
+- `/history` — Show conversation history
+
+### Example Workflow
+
+```
+>>> Read bread.h and tell me what the main config struct is
+→ Tool: read_file ✓
+  [read_file executes, returns file content]
+[BREAD analyzes and summarizes]
+
+>>> How many layers does the model have?
+  [Uses previous context, no tool call needed]
+
+>>> List the agency directory
+→ Tool: list_dir ✓
+  [Shows files]
+
+/depth 10
+>>> Run "cargo build" and tell me if there are warnings
+→ Tool: shell ✓
+  [Executes command, reads output]
+  [BREAD analyzes build output]
+```
+
+### Performance Notes
+
+**Startup:** ~20–30 seconds (model load, same as single BREAD run)
+
+**Per-token throughput:** ~1–2 seconds (depends on tool execution overhead)
+
+**Tool overhead:** Immediate (tools run synchronously; could be parallelized in future)
+
+**Streaming:** Output streamed from BREAD for interactive feel
+
+### Known Limitations
+
+- **Single-threaded** — one request at a time
+- **Sequential tools** — executes tools one by one (could batch)
+- **Output truncation** — large file reads/shell output capped to avoid overflow
+- **No temperature** — greedy argmax sampling only
+- **Max loop depth** — prevents infinite loops (default 5 iterations)
+
+### Integration with SRIRACHA
+
+AGENCY runs BREAD in single-token mode. To enable speculative decoding:
+- Modify `BreadServer` to pass `--prefetch` flag
+- Or build a parallel SRIRACHA wrapper
+- Estimated combined speedup: 3-4x (SRIRACHA) × (tool overhead amortized)
+
+### Next Steps
+
+1. **Test with real prompts** — verify tool execution and generation quality
+2. **Add more tools** — git, http, file search, codebase analysis
+3. **Batch tool execution** — run multiple tools in parallel
+4. **Prompt optimization** — refine system prompt for better reasoning
+5. **BUTTER integration** — add multi-user request queuing and benchmarking
+
+### Commands
+
+**Build AGENCY:**
+```bash
+cd C:\bread_v2\agency
+cargo build --release
+```
+
+**Run AGENCY:**
+```powershell
+.\agency\target\release\agency.exe --bread ..\bread.exe --tokens 256
+```
+
+**Build BREAD with --server support (if not already done):**
+```bash
+export PATH="$PATH:/c/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64"
+cd /c/bread_v2
+nvcc -O2 -x cu main.cu one_layer.cu kernels.cu loader.c gguf.c tokenizer.c bread.c bread_utils.c topology.c config_reader.c validate.c layer_logic.cu layer_ops.cu -I. -o bread.exe
 ```

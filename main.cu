@@ -371,6 +371,9 @@ int main(int argc, char **argv)
     int         force_ssm_zero = 0;
     int         disable_rope = 0;
     int         prefetch_mode = 0;
+    int         server_mode = 0;
+    int         hooks_debug = 0;
+    int         no_progress = 0;
 
     /* -- Parse args ------------------------------------------------- */
     for (int i = 1; i < argc; i++) {
@@ -383,6 +386,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--force-ssm-zero")) force_ssm_zero = 1;
         else if (!strcmp(argv[i], "--disable-rope"))   disable_rope = 1;
         else if (!strcmp(argv[i], "--prefetch")) prefetch_mode = 1;
+        else if (!strcmp(argv[i], "--server"))  server_mode = 1;
+        else if (!strcmp(argv[i], "--hooks-debug")) hooks_debug = 1;
+        else if (!strcmp(argv[i], "--no-progress")) no_progress = 1;
     }
 
     bread_set_boring_mode(minimal_mode);
@@ -392,21 +398,33 @@ int main(int argc, char **argv)
     bread_set_trace_pos(-1);
     bread_set_prefetch_mode(prefetch_mode);
 
-    printf("=== BREAD inference ===\n");
-    printf("Prompt   : \"%s\"\n", prompt);
-    printf("MaxTokens: %d\n\n", max_tokens);
-    printf("Mode     : %s\n\n", minimal_mode ? "minimal-core" : "orchestrated");
-    if (force_ssm_zero) printf("Experiment: force SSM branch output to zero\n");
-    if (disable_rope)   printf("Experiment: disable RoPE\n");
-    if (debug_rms)      printf("Trace    : per-layer hidden RMS + branch RMS + top-5 logits\n");
-    if (force_ssm_zero || disable_rope || debug_rms) printf("\n");
+    /* Initialize progress tracking with default callback */
+    if (!no_progress) {
+        bread_init_progress();
+    }
+
+    /* Enable built-in hooks if requested */
+    if (hooks_debug) {
+        bread_hooks_enable_layer_timing();
+    }
+
+    if (!server_mode) {
+        printf("=== BREAD inference ===\n");
+        printf("Prompt   : \"%s\"\n", prompt);
+        printf("MaxTokens: %d\n\n", max_tokens);
+        printf("Mode     : %s\n\n", minimal_mode ? "minimal-core" : "orchestrated");
+        if (force_ssm_zero) printf("Experiment: force SSM branch output to zero\n");
+        if (disable_rope)   printf("Experiment: disable RoPE\n");
+        if (debug_rms)      printf("Trace    : per-layer hidden RMS + branch RMS + top-5 logits\n");
+        if (force_ssm_zero || disable_rope || debug_rms) printf("\n");
+    }
 
     /* -- Load model into pinned RAM --------------------------------- */
-    printf("[1/4] Loading model into pinned RAM (~22 GB)...\n");
+    if (!server_mode) printf("[1/4] Loading model into pinned RAM (~22 GB)...\n");
     double t0 = now_ms();
     loader_t *L = loader_init(model_path);
     if (!L) { fprintf(stderr, "loader_init failed\n"); return 1; }
-    printf("      done in %.1f s\n\n", (now_ms() - t0) / 1000.0);
+    if (!server_mode) printf("      done in %.1f s\n\n", (now_ms() - t0) / 1000.0);
 
     /* -- Open GGUF for metadata ------------------------------------- */
     gguf_ctx_t *g = gguf_open(model_path);
@@ -418,26 +436,33 @@ int main(int argc, char **argv)
     const bread_model_config_t *cfg = bread_model_config_get();
 
     /* -- Pre-load non-expert weights to VRAM cache ------------------- */
-    printf("      Initializing weight cache...\n");
+    if (!server_mode) printf("      Initializing weight cache...\n");
     weight_cache_t *wc = weight_cache_init(L, g, cfg->num_layers,
                                            bread_layer_is_full_attention);
     if (!wc) { fprintf(stderr, "weight_cache_init failed\n"); return 1; }
 
     /* -- Pre-load all expert weights to VRAM cache ------------------- */
-    printf("      Loading expert weights to VRAM...\n");
+    if (!server_mode) printf("      Loading expert weights to VRAM...\n");
     if (weight_cache_load_experts(wc, L, cfg->num_layers) != 0) {
         fprintf(stderr, "weight_cache_load_experts failed\n");
         return 1;
     }
 
+    /* -- Pre-allocate layer computation buffers ---------------------- */
+    if (!server_mode) printf("      Initializing layer buffer pool...\n");
+    if (bread_buffer_pool_init(cfg) != 0) {
+        fprintf(stderr, "bread_buffer_pool_init failed\n");
+        return 1;
+    }
+
     /* -- Load tokenizer --------------------------------------------- */
-    printf("[2/4] Loading tokenizer...\n");
+    if (!server_mode) printf("[2/4] Loading tokenizer...\n");
     tokenizer_t *tok = tokenizer_load(model_path);
     if (!tok) { fprintf(stderr, "tokenizer_load failed\n"); return 1; }
-    printf("      vocab size: %d\n\n", tokenizer_vocab_size(tok));
+    if (!server_mode) printf("      vocab size: %d\n\n", tokenizer_vocab_size(tok));
 
     /* -- Pre-load output_norm.weight and output.weight to VRAM ------ */
-    printf("[3/4] Uploading output_norm + lm_head to VRAM...\n");
+    if (!server_mode) printf("[3/4] Uploading output_norm + lm_head to VRAM...\n");
 
     const gguf_tensor_t *norm_t = gguf_find_tensor(g, "output_norm.weight");
     if (!norm_t) { fprintf(stderr, "output_norm.weight not found\n"); return 1; }
@@ -446,13 +471,13 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMemcpy(d_norm_w,
                            L->pinned_data + L->data_offset + norm_t->offset,
                            norm_t->size, cudaMemcpyHostToDevice));
-    printf("      output_norm.weight: %.1f KB (F32)\n",
+    if (!server_mode) printf("      output_norm.weight: %.1f KB (F32)\n",
            norm_t->size / 1024.0);
 
     /* Try output.weight; fall back to token_embd.weight (tied) */
     const gguf_tensor_t *out_t = gguf_find_tensor(g, "output.weight");
     if (!out_t) {
-        printf("      output.weight not found — using token_embd.weight (tied)\n");
+        if (!server_mode) printf("      output.weight not found — using token_embd.weight (tied)\n");
         out_t = gguf_find_tensor(g, "token_embd.weight");
     }
     if (!out_t) { fprintf(stderr, "no lm_head weight found\n"); return 1; }
@@ -461,31 +486,9 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMemcpy(d_output_w,
                            L->pinned_data + L->data_offset + out_t->offset,
                            out_t->size, cudaMemcpyHostToDevice));
-    printf("      output.weight:      %.1f MB (type %s)\n",
+    if (!server_mode) printf("      output.weight:      %.1f MB (type %s)\n",
            out_t->size / 1024.0 / 1024.0,
            ggml_type_name(out_t->type));
-
-    /* -- Encode prompt ---------------------------------------------- */
-    printf("\n[4/4] Encoding prompt...\n");
-    int32_t token_buf[4096];
-    int32_t bos = tokenizer_bos(tok);
-    int n_prompt;
-    char *model_prompt = format_prompt_for_model(tok, prompt);
-    if (!model_prompt) { fprintf(stderr, "prompt formatting failed\n"); return 1; }
-    if (bos >= 0) {
-        token_buf[0] = bos;
-        n_prompt = 1 + tokenizer_encode(tok, model_prompt, token_buf + 1, 4095);
-    } else {
-        /* No BOS token for this model (Qwen3.5 style) — encode prompt directly */
-        n_prompt = tokenizer_encode(tok, model_prompt, token_buf, 4096);
-    }
-    printf("      %d tokens: [", n_prompt);
-    for (int i = 0; i < n_prompt && i < 8; i++)
-        printf("%s%d", i ? " " : "", token_buf[i]);
-    if (n_prompt > 8) printf(" ...");
-    printf("]\n\n");
-    if (debug_rms && n_prompt > 0) bread_set_trace_pos(n_prompt - 1);
-    free(model_prompt);
 
     /* -- CUDA resources --------------------------------------------- */
     cudaStream_t stream_a;
@@ -504,13 +507,84 @@ int main(int argc, char **argv)
         fprintf(stderr, "malloc failed\n"); return 1;
     }
 
+    /* -- Server mode initialization --------------------------------- */
+    if (server_mode) {
+        printf("BREAD_READY\n");
+        fflush(stdout);
+    }
+
+    char stdin_buf[8192];
+    if (!server_mode) {
+        /* Single-mode: use argv prompt */
+        strncpy(stdin_buf, prompt, sizeof(stdin_buf) - 1);
+        stdin_buf[sizeof(stdin_buf) - 1] = '\0';
+    }
+
+    /* -- Server/single-prompt loop --------------------------------- */
+    do {
+        if (server_mode) {
+            /* Read full multi-line prompt until double newline (empty line) */
+            int pos = 0;
+            int empty_lines = 0;
+            while (pos < (int)sizeof(stdin_buf) - 1) {
+                int c = fgetc(stdin);
+                if (c == EOF) {
+                    stdin_buf[pos] = '\0';
+                    empty_lines = 2;  /* Force exit */
+                    break;
+                }
+                stdin_buf[pos++] = (char)c;
+
+                /* Track consecutive newlines to detect double-newline (empty line) */
+                if (c == '\n') {
+                    empty_lines++;
+                    if (empty_lines == 2) {
+                        /* Double newline found; remove both trailing newlines */
+                        pos -= 2;
+                        stdin_buf[pos] = '\0';
+                        break;
+                    }
+                } else if (c != '\n') {
+                    empty_lines = 0;
+                }
+            }
+            if (pos == 0) break;  /* EOF or error */
+        }
+        prompt = stdin_buf;
+
+        /* -- Encode prompt ---------------------------------------------- */
+        if (!server_mode) {
+            printf("\n[4/4] Encoding prompt...\n");
+        }
+        int32_t token_buf[4096];
+        int32_t bos = tokenizer_bos(tok);
+        int n_prompt;
+        char *model_prompt = format_prompt_for_model(tok, prompt);
+        if (!model_prompt) { fprintf(stderr, "prompt formatting failed\n"); return 1; }
+        if (bos >= 0) {
+            token_buf[0] = bos;
+            n_prompt = 1 + tokenizer_encode(tok, model_prompt, token_buf + 1, 4095);
+        } else {
+            /* No BOS token for this model (Qwen3.5 style) — encode prompt directly */
+            n_prompt = tokenizer_encode(tok, model_prompt, token_buf, 4096);
+        }
+        if (!server_mode) {
+            printf("      %d tokens: [", n_prompt);
+            for (int i = 0; i < n_prompt && i < 8; i++)
+                printf("%s%d", i ? " " : "", token_buf[i]);
+            if (n_prompt > 8) printf(" ...");
+            printf("]\n\n");
+        }
+        if (debug_rms && n_prompt > 0) bread_set_trace_pos(n_prompt - 1);
+        free(model_prompt);
+
     /* ================================================================
      * Prompt prefill: feed each prompt token through all 40 layers.
      * The final hidden state of the last token seeds generation.
      * (No KV cache — each token sees only itself; layers apply norms
      *  and MoE FFN correctly.  SSM state is stubbed.)
      * ================================================================ */
-    printf("--- Prompt prefill (%d tokens) ---\n", n_prompt);
+    if (!server_mode) printf("--- Prompt prefill (%d tokens) ---\n", n_prompt);
     double t_prefill_start = now_ms();
 
     for (int p = 0; p < n_prompt; p++) {
@@ -522,7 +596,9 @@ int main(int argc, char **argv)
         }
         for (int layer = 0; layer < cfg->num_layers; layer++)
         {
+            bread_fire_hook(BREAD_HOOK_PRE_LAYER, p, layer, d_hidden, 0.0);
             one_layer_forward(d_hidden, layer, p, L, g, wc, stream_a);
+            bread_fire_hook(BREAD_HOOK_POST_LAYER, p, layer, d_hidden, 0.0);
             if (debug_rms && p == n_prompt - 1) {
                 float hidden_rms = minimal_mode
                     ? one_layer_cpu_hidden_rms(cfg->hidden_dim)
@@ -539,7 +615,7 @@ int main(int argc, char **argv)
 
     double t_prefill_done = now_ms();
     double prefill_ms = t_prefill_done - t_prefill_start;
-    printf("    prefill: %.0f ms  (%.1f ms/tok)\n\n",
+    if (!server_mode) printf("    prefill: %.0f ms  (%.1f ms/tok)\n\n",
            prefill_ms, prefill_ms / n_prompt);
 
     /* ================================================================
@@ -558,7 +634,7 @@ int main(int argc, char **argv)
     double ttft_ms = t_ttft_done - t_ttft_start;
 
     /* Stream first token */
-    printf("--- Generated output ---\n");
+    if (!server_mode) printf("--- Generated output ---\n");
     {
         char *s = tokenizer_decode(tok, &next_tok, 1);
         printf("%s", s);
@@ -574,16 +650,23 @@ int main(int argc, char **argv)
     double  t_gen_start = now_ms();
 
     while (n_gen < max_tokens && next_tok != eos) {
+        double t_token_start = now_ms();
         embed_token(next_tok, cfg, L, g, d_hidden, h_emb_row);
 
+        bread_fire_hook(BREAD_HOOK_PRE_TOKEN, n_prompt + n_gen, -1, d_hidden, 0.0);
+
         for (int layer = 0; layer < cfg->num_layers; layer++) {
+            bread_fire_hook(BREAD_HOOK_PRE_LAYER, n_prompt + n_gen, layer, d_hidden, 0.0);
             one_layer_forward(d_hidden, layer, n_prompt + n_gen, L, g, wc, stream_a);
+            bread_fire_hook(BREAD_HOOK_POST_LAYER, n_prompt + n_gen, layer, d_hidden, 0.0);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
+        bread_fire_hook(BREAD_HOOK_PRE_SAMPLE, n_prompt + n_gen, -1, d_hidden, 0.0);
         apply_output_norm(cfg, d_hidden, d_norm_w, stream_a);
         compute_logits(cfg, d_hidden, d_output_w, out_t->type, d_logits, stream_a);
         next_tok = greedy_sample(d_logits, h_logits);
+        bread_fire_hook(BREAD_HOOK_POST_SAMPLE, n_prompt + n_gen, -1, d_hidden, 0.0);
 
         if (next_tok != eos) {
             char *s = tokenizer_decode(tok, &next_tok, 1);
@@ -591,30 +674,51 @@ int main(int argc, char **argv)
             fflush(stdout);
             free(s);
         }
+
+        bread_fire_hook(BREAD_HOOK_POST_TOKEN, n_prompt + n_gen, -1, d_hidden, 0.0);
+
+        /* Report progress periodically (every 10 tokens) — skip in server mode */
+        if (!server_mode && !no_progress && (n_gen % 10 == 0 || n_gen == max_tokens - 1)) {
+            double elapsed = now_ms() - t_gen_start;
+            double tok_per_s = (n_gen > 0) ? (double)n_gen / (elapsed / 1000.0) : 0.0;
+            bread_progress_report(BREAD_PROGRESS_DECODE, n_gen, max_tokens, elapsed, tok_per_s, -1);
+        }
+
         n_gen++;
     }
 
     double t_gen_done = now_ms();
-    printf("\n\n");
-
-    /* ================================================================
-     * Benchmark report
-     * ================================================================ */
-    double decode_ms  = (t_gen_done - t_gen_start) + ttft_ms;
-    double tok_per_s  = (n_gen > 0) ? (double)n_gen / (decode_ms / 1000.0) : 0.0;
-
-    printf("=== Benchmark ===\n");
-    printf("  Prompt tokens    : %d\n",    n_prompt);
-    printf("  Generated tokens : %d\n",    n_gen);
-    printf("  Prefill          : %.0f ms  (%.1f ms/tok)\n",
-           prefill_ms, prefill_ms / n_prompt);
-    printf("  Time to 1st tok  : %.1f ms\n",   ttft_ms);
-    printf("  Total decode     : %.0f ms  (%.2f tok/s)\n",
-           decode_ms, tok_per_s);
     printf("\n");
-    printf("  NOTE: one_layer_forward() allocates/frees VRAM per call —\n");
-    printf("  bulk of time is cudaMalloc overhead, not compute.\n");
-    printf("  Next step: cache non-expert weights in VRAM at startup.\n");
+
+    if (!server_mode) {
+        /* ================================================================
+         * Benchmark report (only for single-mode)
+         * ================================================================ */
+        double decode_ms  = (t_gen_done - t_gen_start) + ttft_ms;
+        double tok_per_s  = (n_gen > 0) ? (double)n_gen / (decode_ms / 1000.0) : 0.0;
+
+        printf("\n=== Benchmark ===\n");
+        printf("  Prompt tokens    : %d\n",    n_prompt);
+        printf("  Generated tokens : %d\n",    n_gen);
+        printf("  Prefill          : %.0f ms  (%.1f ms/tok)\n",
+               prefill_ms, prefill_ms / n_prompt);
+        printf("  Time to 1st tok  : %.1f ms\n",   ttft_ms);
+        printf("  Total decode     : %.0f ms  (%.2f tok/s)\n",
+               decode_ms, tok_per_s);
+        printf("\n");
+        printf("  NOTE: one_layer_forward() allocates/frees VRAM per call —\n");
+        printf("  bulk of time is cudaMalloc overhead, not compute.\n");
+        printf("  Next step: cache non-expert weights in VRAM at startup.\n");
+
+        /* Report layer timing if hooks were enabled */
+        bread_hooks_report_layer_timing();
+    } else {
+        /* Server mode: print sentinel to signal end of generation */
+        printf("BREAD_END\n");
+        fflush(stdout);
+    }
+
+    } while (server_mode);  /* End of server/single-prompt loop */
 
     /* -- Cleanup ---------------------------------------------------- */
     free(h_emb_row);
@@ -624,6 +728,7 @@ int main(int argc, char **argv)
     cudaFree(d_norm_w);
     cudaFree(d_output_w);
     cudaStreamDestroy(stream_a);
+    bread_buffer_pool_free();
     weight_cache_free(wc);
     tokenizer_free(tok);
     gguf_close(g);

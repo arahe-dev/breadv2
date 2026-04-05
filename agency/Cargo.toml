@@ -1,0 +1,17 @@
+[package]
+name = "agency"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "agency"
+path = "src/main.rs"
+
+[dependencies]
+rustyline = "14"
+colored = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+anyhow = "1"
+thiserror = "1"

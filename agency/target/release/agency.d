@@ -1,0 +1,1 @@
+C:\bread_v2\agency\target\release\agency.exe: C:\bread_v2\agency\src\bread.rs C:\bread_v2\agency\src\hermes.rs C:\bread_v2\agency\src\main.rs C:\bread_v2\agency\src\repl.rs C:\bread_v2\agency\src\tools.rs
