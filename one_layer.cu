@@ -919,6 +919,15 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     static int    kv_cache_len[LOADER_MAX_LAYERS] = {0};
     static int    cpu_hidden_pos = -1;
     static int    cpu_hidden_layer = -1;
+    static int    last_pos = -1;  /* Detect new query */
+
+    /* Reset KV cache counters when starting a new query (pos decreases or resets) */
+    if (layer_idx == 0 && (last_pos >= 0 && pos <= last_pos)) {
+        fprintf(stderr, "[RESET] Query state detected: last_pos=%d pos=%d - resetting KV cache\n",
+                last_pos, pos);
+        memset(kv_cache_len, 0, sizeof(kv_cache_len));
+    }
+    if (layer_idx == 0) last_pos = pos;
 
     if (!d_normed) {
         CUDA_CHECK(cudaMalloc(&d_normed,   H                          * sizeof(half)));
@@ -1523,9 +1532,19 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             cpu_repeat_heads(h_ssm_krep, lin_k, num_k_heads, num_v_heads, key_dim);
 
             for (int vh = 0; vh < num_v_heads; vh++) {
+                /* Bounds validation for SSM state access */
+                size_t expected_state_size = (size_t)num_v_heads * value_dim * key_dim;
+                size_t offset = (size_t)vh * value_dim * key_dim;
+                if (offset + value_dim * key_dim > expected_state_size) {
+                    fprintf(stderr, "ERROR: SSM state out of bounds at token %d layer %d vh %d\n"
+                            "  offset=%zu expected_size=%zu total_needed=%zu\n",
+                            pos, layer_idx, vh, offset, expected_state_size, offset + value_dim * key_dim);
+                    exit(1);
+                }
+
                 float gate = cpu_softplus(h_alpha[vh] + ssm_dt[vh]) * ssm_a[vh];
                 float beta_gate = cpu_sigmoid(h_beta[vh]);
-                float *S = layer_state + (size_t)vh * value_dim * key_dim;
+                float *S = layer_state + offset;
                 float *q_h = h_ssm_qrep + (size_t)vh * key_dim;
                 float *k_h = h_ssm_krep + (size_t)vh * key_dim;
                 float *v_h = lin_v + vh * value_dim;
