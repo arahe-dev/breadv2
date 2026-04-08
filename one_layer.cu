@@ -167,9 +167,9 @@ static const half *tensor_ram_f16(const loader_t *L, const gguf_ctx_t *g,
     return (const half *)(L->pinned_data + L->data_offset + t->offset);
 }
 
-static void *load_expert_tensor_vram(const loader_t *L, const gguf_ctx_t *g,
+static void *load_expert_tensor_vram_stream(const loader_t *L, const gguf_ctx_t *g,
                                      const char *name, int expert_idx,
-                                     uint32_t *type_out)
+                                     uint32_t *type_out, cudaStream_t stream)
 {
     const gguf_tensor_t *t = require_tensor(g, name);
     int n_experts = (int)t->dims[t->n_dims - 1];
@@ -185,23 +185,38 @@ static void *load_expert_tensor_vram(const loader_t *L, const gguf_ctx_t *g,
 
     expert_bytes = t->size / (uint64_t)n_experts;
     src = L->pinned_data + L->data_offset + t->offset + (uint64_t)expert_idx * expert_bytes;
-    CUDA_CHECK(cudaMalloc(&d, (size_t)expert_bytes));
+    CUDA_CHECK(cudaMallocAsync(&d, (size_t)expert_bytes, stream));
     CUDA_CHECK(cudaMemcpy(d, src, (size_t)expert_bytes, cudaMemcpyHostToDevice));
     if (type_out) *type_out = t->type;
     return d;
 }
 
+static void *load_expert_tensor_vram(const loader_t *L, const gguf_ctx_t *g,
+                                     const char *name, int expert_idx,
+                                     uint32_t *type_out)
+{
+    return load_expert_tensor_vram_stream(L, g, name, expert_idx, type_out, NULL);
+}
+
 /* Allocate VRAM and copy a tensor from pinned RAM.
- * Used as fallback when weight cache is not available. */
-static void *load_vram(const loader_t *L, const gguf_ctx_t *g,
-                        const char *name)
+ * Used as fallback when weight cache is not available.
+ * NOTE: Modified to accept stream for async allocation. */
+static void *load_vram_stream(const loader_t *L, const gguf_ctx_t *g,
+                        const char *name, cudaStream_t stream)
 {
     const gguf_tensor_t *t = require_tensor(g, name);
     void *d;
-    CUDA_CHECK(cudaMalloc(&d, t->size));
+    CUDA_CHECK(cudaMallocAsync(&d, t->size, stream));
     CUDA_CHECK(cudaMemcpy(d, L->pinned_data + L->data_offset + t->offset,
                            t->size, cudaMemcpyHostToDevice));
     return d;
+}
+
+/* Backward compat wrapper for old API */
+static void *load_vram(const loader_t *L, const gguf_ctx_t *g,
+                        const char *name)
+{
+    return load_vram_stream(L, g, name, NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -739,6 +754,55 @@ static void apply_per_head_rms_norm(float *x,
 /* g             — GGUF context (tensor metadata).                     */
 /* stream_a      — CUDA stream for compute kernels.                   */
 /* ================================================================== */
+
+/* ================================================================== */
+/* CPU-Side Arena Allocator (low-overhead buffer reuse)               */
+/* ================================================================== */
+
+typedef struct {
+    float *data;
+    size_t used;
+    size_t capacity;
+} cpu_arena_t;
+
+static cpu_arena_t g_cpu_arena = {NULL, 0, 0};
+
+void cpu_arena_init(size_t capacity) {
+    if (g_cpu_arena.data) free(g_cpu_arena.data);
+    g_cpu_arena.data = (float *)malloc(capacity);
+    g_cpu_arena.capacity = capacity;
+    g_cpu_arena.used = 0;
+    if (!g_cpu_arena.data) {
+        fprintf(stderr, "cpu_arena_init: malloc failed for %zu bytes\n", capacity);
+        exit(1);
+    }
+}
+
+void cpu_arena_reset(void) {
+    g_cpu_arena.used = 0;
+}
+
+void *cpu_arena_alloc(size_t size) {
+    /* Align to 64-byte boundary for cache efficiency */
+    size_t aligned_size = (size + 63) & ~63UL;
+    if (g_cpu_arena.used + aligned_size > g_cpu_arena.capacity) {
+        fprintf(stderr, "cpu_arena_alloc: out of memory (used=%zu + requested=%zu > capacity=%zu)\n",
+                g_cpu_arena.used, aligned_size, g_cpu_arena.capacity);
+        exit(1);
+    }
+    void *ptr = g_cpu_arena.data + g_cpu_arena.used;
+    g_cpu_arena.used += aligned_size;
+    return ptr;
+}
+
+void cpu_arena_free(void) {
+    if (g_cpu_arena.data) {
+        free(g_cpu_arena.data);
+        g_cpu_arena.data = NULL;
+        g_cpu_arena.used = 0;
+        g_cpu_arena.capacity = 0;
+    }
+}
 
 /* File-scope so one_layer_cpu_hidden_rms() can access it */
 static float *g_h_hidden = NULL;
@@ -1322,7 +1386,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             d_attn_norm_w = (float *)wc->layers[layer_idx].attn_norm_w;
         } else {
             snprintf(nm, sizeof(nm), "blk.%d.attn_norm.weight", layer_idx);
-            d_attn_norm_w = (float *)load_vram(L, g, nm);
+            d_attn_norm_w = (float *)load_vram_stream(L, g, nm, stream_a);
         }
 
         /* Copy hidden → normed, then normalise normed in-place */
@@ -1331,7 +1395,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         rmsnorm_inplace<<<1, 256, 0, stream_a>>>(d_normed, d_attn_norm_w,
                                                   H, cfg->rms_eps);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        if (!wc) cudaFree(d_attn_norm_w);
+        if (!wc) cudaFreeAsync(d_attn_norm_w, stream_a);
     }
 
     /* ================================================================
@@ -1348,11 +1412,11 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             d_vw = wc->layers[layer_idx].attn_v_w;
         } else {
             snprintf(nm, sizeof(nm), "blk.%d.attn_q.weight", layer_idx);
-            d_qw = load_vram(L, g, nm);
+            d_qw = load_vram_stream(L, g, nm, stream_a);
             snprintf(nm, sizeof(nm), "blk.%d.attn_k.weight", layer_idx);
-            d_kw = load_vram(L, g, nm);
+            d_kw = load_vram_stream(L, g, nm, stream_a);
             snprintf(nm, sizeof(nm), "blk.%d.attn_v.weight", layer_idx);
-            d_vw = load_vram(L, g, nm);
+            d_vw = load_vram_stream(L, g, nm, stream_a);
         }
 
         bread_matvec(d_qw, d_normed, d_q,
@@ -1363,7 +1427,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                      cfg->kv_proj_dim, H, GGML_TYPE_Q6_K, stream_a);
 
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        if (!wc) { cudaFree(d_qw); cudaFree(d_kw); cudaFree(d_vw); }
+        if (!wc) { cudaFreeAsync(d_qw, stream_a); cudaFreeAsync(d_kw, stream_a); cudaFreeAsync(d_vw, stream_a); }
     }
 
     /* ================================================================
@@ -1455,13 +1519,13 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             d_beta_w = wc->layers[layer_idx].ssm_beta_w;
         } else {
             snprintf(nm, sizeof(nm), "blk.%d.attn_qkv.weight", layer_idx);
-            d_qkv_w = load_vram(L, g, nm);
+            d_qkv_w = load_vram_stream(L, g, nm, stream_a);
             snprintf(nm, sizeof(nm), "blk.%d.attn_gate.weight", layer_idx);
-            d_gate_w = load_vram(L, g, nm);
+            d_gate_w = load_vram_stream(L, g, nm, stream_a);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_alpha.weight", layer_idx);
-            d_alpha_w = load_vram(L, g, nm);
+            d_alpha_w = load_vram_stream(L, g, nm, stream_a);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_beta.weight", layer_idx);
-            d_beta_w = load_vram(L, g, nm);
+            d_beta_w = load_vram_stream(L, g, nm, stream_a);
         }
 
         bread_matvec(d_qkv_w, d_normed, d_qkv,
@@ -1475,10 +1539,10 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
 
         if (!wc) {
-            cudaFree(d_qkv_w);
-            cudaFree(d_gate_w);
-            cudaFree(d_alpha_w);
-            cudaFree(d_beta_w);
+            cudaFreeAsync(d_qkv_w, stream_a);
+            cudaFreeAsync(d_gate_w, stream_a);
+            cudaFreeAsync(d_alpha_w, stream_a);
+            cudaFreeAsync(d_beta_w, stream_a);
         }
 
         vram_half_to_cpu_float(d_qkv, h_qkv, cfg->ssm_qkv_dim);
@@ -1583,13 +1647,13 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             d_ow = wc->layers[layer_idx].attn_output_w;
         } else {
             snprintf(nm, sizeof(nm), "blk.%d.attn_output.weight", layer_idx);
-            d_ow = load_vram(L, g, nm);
+            d_ow = load_vram_stream(L, g, nm, stream_a);
         }
 
         bread_matvec(d_ow, d_attn_out, d_o_out,
                      H, cfg->attn_out_dim, GGML_TYPE_Q4_K, stream_a);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        if (!wc) cudaFree(d_ow);
+        if (!wc) cudaFreeAsync(d_ow, stream_a);
         if (bread_get_trace_debug()) {
             g_last_branch_rms = device_half_rms(d_o_out, H);
         }
@@ -1603,13 +1667,13 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             d_sw = wc->layers[layer_idx].ssm_out_w;
         } else {
             snprintf(nm, sizeof(nm), "blk.%d.ssm_out.weight", layer_idx);
-            d_sw = load_vram(L, g, nm);
+            d_sw = load_vram_stream(L, g, nm, stream_a);
         }
 
         bread_matvec(d_sw, d_attn_out, d_o_out,
                      H, cfg->ssm_z_dim, GGML_TYPE_Q4_K, stream_a);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        if (!wc) cudaFree(d_sw);
+        if (!wc) cudaFreeAsync(d_sw, stream_a);
         if (bread_get_force_ssm_zero()) {
             CUDA_CHECK(cudaMemset(d_o_out, 0, (size_t)H * sizeof(half)));
         }
@@ -1631,7 +1695,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             d_pan_w = (float *)wc->layers[layer_idx].post_attn_norm_w;
         } else {
             snprintf(nm, sizeof(nm), "blk.%d.post_attention_norm.weight", layer_idx);
-            d_pan_w = (float *)load_vram(L, g, nm);
+            d_pan_w = (float *)load_vram_stream(L, g, nm, stream_a);
         }
 
         int blocks = (H + 255) / 256;
@@ -1639,7 +1703,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         rmsnorm_inplace<<<1, 256, 0, stream_a>>>(d_normed2, d_pan_w,
                                                   H, cfg->rms_eps);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        if (!wc) cudaFree(d_pan_w);
+        if (!wc) cudaFreeAsync(d_pan_w, stream_a);
     }
 
     /* ================================================================
@@ -1657,9 +1721,9 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         d_su_w = wc->layers[layer_idx].ffn_up_shexp_w;
     } else {
         snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_shexp.weight", layer_idx);
-        d_sg_w = load_vram(L, g, nm);
+        d_sg_w = load_vram_stream(L, g, nm, stream_a);
         snprintf(nm, sizeof(nm), "blk.%d.ffn_up_shexp.weight", layer_idx);
-        d_su_w = load_vram(L, g, nm);
+        d_su_w = load_vram_stream(L, g, nm, stream_a);
     }
 
     bread_matvec(d_sg_w, d_normed2, d_sg,
@@ -1680,7 +1744,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
     /* Sync stream_a for shared gate+up (should complete in ~8 μs, routing took ~500 μs → 0 wait) */
     CUDA_CHECK(cudaStreamSynchronize(stream_a));
-    if (!wc) { cudaFree(d_sg_w); cudaFree(d_su_w); }
+    if (!wc) { cudaFreeAsync(d_sg_w, stream_a); cudaFreeAsync(d_su_w, stream_a); }
 
     /* ================================================================
      * CMD3a: shared expert SwiGLU + down projection → accumulate
@@ -1696,13 +1760,13 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             d_sd_w = wc->layers[layer_idx].ffn_down_shexp_w;
         } else {
             snprintf(nm, sizeof(nm), "blk.%d.ffn_down_shexp.weight", layer_idx);
-            d_sd_w = load_vram(L, g, nm);
+            d_sd_w = load_vram_stream(L, g, nm, stream_a);
         }
 
         bread_matvec(d_sd_w, d_sg, d_sh_out,
                      H, cfg->shared_inter, GGML_TYPE_Q6_K, stream_a);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        if (!wc) cudaFree(d_sd_w);
+        if (!wc) cudaFreeAsync(d_sd_w, stream_a);
 
         {
             float shared_weight = cpu_sigmoid(shared_gate_score);
@@ -1790,10 +1854,10 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
         /* Load next layer's post-attn norm weight */
         snprintf(nm, sizeof(nm), "blk.%d.post_attention_norm.weight", layer_idx + 1);
-        float *d_pan_next = (float *)load_vram(L, g, nm);
+        float *d_pan_next = (float *)load_vram_stream(L, g, nm, stream_a);
         rmsnorm_inplace<<<1, 256, 0, stream_a>>>(d_normed_prefetch, d_pan_next, H, cfg->rms_eps);
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        cudaFree(d_pan_next);
+        cudaFreeAsync(d_pan_next, stream_a);
 
         /* Route for next layer and prefetch on stream_c */
         route_layer(L, g, layer_idx + 1, d_normed_prefetch,

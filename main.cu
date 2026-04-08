@@ -57,6 +57,10 @@ extern float route_layer(loader_t *L, gguf_ctx_t *g, int layer_idx,
                          int *expert_indices, float *expert_weights);
 extern float one_layer_cpu_hidden_rms(int hidden_dim);
 extern float one_layer_last_branch_rms(void);
+extern void cpu_arena_init(size_t capacity);
+extern void cpu_arena_reset(void);
+extern void *cpu_arena_alloc(size_t size);
+extern void cpu_arena_free(void);
 
 /* kernels.cu */
 extern void bread_matvec(void *w, half *x, half *y,
@@ -455,6 +459,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* -- Initialize CPU-side arena allocator for low-overhead reuse --- */
+    cpu_arena_init(300000000);  /* 300 MB for temporary CPU buffers */
+
     /* -- Load tokenizer --------------------------------------------- */
     if (!server_mode) printf("[2/4] Loading tokenizer...\n");
     tokenizer_t *tok = tokenizer_load(model_path);
@@ -650,6 +657,7 @@ int main(int argc, char **argv)
     double  t_gen_start = now_ms();
 
     while (n_gen < max_tokens && next_tok != eos) {
+        cpu_arena_reset();  /* Reset arena for this token */
         double t_token_start = now_ms();
         embed_token(next_tok, cfg, L, g, d_hidden, h_emb_row);
 
@@ -729,6 +737,7 @@ int main(int argc, char **argv)
     cudaFree(d_output_w);
     cudaStreamDestroy(stream_a);
     bread_buffer_pool_free();
+    cpu_arena_free();
     weight_cache_free(wc);
     tokenizer_free(tok);
     gguf_close(g);
