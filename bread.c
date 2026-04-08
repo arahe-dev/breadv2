@@ -383,3 +383,9 @@ int bread_get_prefetch_mode(void)
 {
     return g_prefetch_mode;
 }
+
+/* Initialize default progress callback */
+void bread_init_progress(void)
+{
+    bread_progress_init_default();
+}

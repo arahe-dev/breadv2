@@ -2,6 +2,10 @@
 #define BREAD_H
 
 #include "gguf.h"
+#include "kernel_tasks.h"
+#include "error_classification.h"
+#include "progress_tracking.h"
+#include "hooks.h"
 
 /* bread.h — model constants for Qwen3.5-35B-A3B (GGUF verified)
  *
@@ -76,7 +80,7 @@
     "C:\\Users\\arahe\\.ollama\\models\\blobs\\" \
     "sha256-900dde62fb7ebe8a5a25e35d5b7633f403f226a310965fed51d50f5238ba145a"
 
-typedef struct {
+typedef struct bread_model_config {
     int hidden_dim;
     int num_layers;
     int vocab_size;
@@ -116,6 +120,8 @@ typedef struct {
     float rope_freq_base;
 } bread_model_config_t;
 
+#include "buffer_pool.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -136,6 +142,7 @@ void bread_set_trace_pos(int pos);
 int bread_get_trace_pos(void);
 void bread_set_prefetch_mode(int enabled);
 int bread_get_prefetch_mode(void);
+void bread_init_progress(void);
 
 #ifdef __cplusplus
 }

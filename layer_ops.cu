@@ -333,12 +333,106 @@ void cpu_repeat_heads(float *dst, const float *src,
     }
 }
 
+/* ================================================================== */
+/* AVX2 Horizontal Sum Helper                                         */
+/* ================================================================== */
+#ifdef __AVX2__
+#include <immintrin.h>
+
+static inline float m256_hsum(__m256 v) {
+    __m256 shuf = _mm256_permute2f128_ps(v, v, 0x1);
+    v = _mm256_add_ps(v, shuf);
+    shuf = _mm256_shuffle_ps(v, v, 0x4E);
+    v = _mm256_add_ps(v, shuf);
+    shuf = _mm256_shuffle_ps(v, v, 0xB1);
+    v = _mm256_add_ps(v, shuf);
+    return _mm256_cvtss_f32(v);
+}
+#endif
+
 void cpu_delta_net_autoregressive_step(const float *q, const float *k,
                                        const float *v, float gate, float beta,
                                        float *state, float *out,
                                        int value_dim, int key_dim,
                                        float *sk_buf, float *d_buf)
 {
+    /* Bounds checking: validate dimensions before processing */
+    if (value_dim <= 0 || key_dim <= 0) {
+        fprintf(stderr, "ERROR: cpu_delta_net_autoregressive_step invalid dims: value_dim=%d key_dim=%d\n",
+                value_dim, key_dim);
+        exit(1);
+    }
+    if (!state || !out || !q || !k || !v || !sk_buf || !d_buf) {
+        fprintf(stderr, "ERROR: cpu_delta_net_autoregressive_step NULL pointer\n");
+        exit(1);
+    }
+
+#ifdef __AVX2__
+    /* SIMD-accelerated version for key_dim >= 8 */
+    __m256 decay_v = _mm256_set1_ps(expf(gate));
+    __m256 beta_v = _mm256_set1_ps(beta);
+
+    /* Phase 1: State decay (multiply by scalar) */
+    for (int vi = 0; vi < value_dim; vi++) {
+        float *row = state + (size_t)vi * key_dim;
+        for (int ki = 0; ki < key_dim; ki += 8) {
+            __m256 state_v = _mm256_loadu_ps(row + ki);
+            state_v = _mm256_mul_ps(state_v, decay_v);
+            _mm256_storeu_ps(row + ki, state_v);
+        }
+    }
+
+    /* Phase 2: Compute sk = state[vi] · k, then delta[vi] = (v[vi] - sk) * beta */
+    for (int vi = 0; vi < value_dim; vi++) {
+        const float *row = state + (size_t)vi * key_dim;
+        __m256 sk_v = _mm256_setzero_ps();
+
+        /* Vectorized dot product */
+        for (int ki = 0; ki < key_dim; ki += 8) {
+            __m256 row_v = _mm256_loadu_ps(row + ki);
+            __m256 k_v = _mm256_loadu_ps(k + ki);
+            sk_v = _mm256_fmadd_ps(row_v, k_v, sk_v);
+        }
+
+        /* Horizontal sum */
+        float sk = m256_hsum(sk_v);
+        sk_buf[vi] = sk;
+        d_buf[vi] = (v[vi] - sk) * beta;
+    }
+
+    /* Phase 3: State update with FMA (state[vi][k] += k[k] * delta[vi]) */
+    for (int vi = 0; vi < value_dim; vi++) {
+        float *row = state + (size_t)vi * key_dim;
+        float d = d_buf[vi];
+        __m256 d_v = _mm256_set1_ps(d);
+
+        for (int ki = 0; ki < key_dim; ki += 8) {
+            __m256 state_v = _mm256_loadu_ps(row + ki);
+            __m256 k_v = _mm256_loadu_ps(k + ki);
+            /* state += k * d using FMA */
+            state_v = _mm256_fmadd_ps(k_v, d_v, state_v);
+            _mm256_storeu_ps(row + ki, state_v);
+        }
+    }
+
+    /* Phase 4: Compute output (state[vi] · q) */
+    for (int vi = 0; vi < value_dim; vi++) {
+        const float *row = state + (size_t)vi * key_dim;
+        __m256 acc_v = _mm256_setzero_ps();
+
+        /* Vectorized dot product */
+        for (int ki = 0; ki < key_dim; ki += 8) {
+            __m256 row_v = _mm256_loadu_ps(row + ki);
+            __m256 q_v = _mm256_loadu_ps(q + ki);
+            acc_v = _mm256_fmadd_ps(row_v, q_v, acc_v);
+        }
+
+        /* Horizontal sum */
+        out[vi] = m256_hsum(acc_v);
+    }
+
+#else
+    /* Scalar fallback for systems without AVX2 */
     float decay = expf(gate);
     for (int vi = 0; vi < value_dim; vi++) {
         float *row = state + (size_t)vi * key_dim;
@@ -362,6 +456,7 @@ void cpu_delta_net_autoregressive_step(const float *q, const float *k,
         for (int ki = 0; ki < key_dim; ki++) acc += row[ki] * q[ki];
         out[vi] = acc;
     }
+#endif
 }
 
 /* ================================================================== */

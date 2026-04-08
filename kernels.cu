@@ -141,11 +141,14 @@ static __device__ __forceinline__ float warp_reduce_sum(float v) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Q4_K matvec kernel                                                   */
+/* Q4_K matvec kernel — FMA reformulation                              */
 /*                                                                      */
 /* y[row] = sum_col( dequant(W[row, col]) * x[col] )                  */
+/*                                                                      */
+/* FMA chain: instead of (d*sc*nibble - dmin*m) * x → separate mul,  */
+/* use fmaf(nibble, d*sc*x, fmaf(-m, dmin*x, sum)) so the GPU fuses  */
+/* dequant and accumulation into 2 FMA instructions per element.      */
 /* Grid: (rows,)   Block: (256,)                                       */
-/* Shared: 256 floats for x-tile + 8 floats for warp reduction        */
 /* ------------------------------------------------------------------ */
 __global__ void dequant_q4k_matvec(
     const uint8_t * __restrict__ w,
@@ -154,37 +157,67 @@ __global__ void dequant_q4k_matvec(
     int rows, int cols)
 {
     __shared__ float sx[BLOCK_ELEMS];
-    __shared__ float warp_buf[8];           /* one slot per warp (8 warps) */
+    __shared__ float warp_buf[8];
 
-    int row    = (int)blockIdx.x;
+    int row     = (int)blockIdx.x;
     if (row >= rows) return;
 
-    int tid    = (int)threadIdx.x;
-    int warp   = tid >> 5;
-    int lane   = tid & 31;
-    int nblocks = cols / BLOCK_ELEMS;       /* Q4_K blocks per row */
+    int tid     = (int)threadIdx.x;
+    int warp    = tid >> 5;
+    int lane    = tid & 31;
+    int nblocks = cols / BLOCK_ELEMS;
+
+    /* Pre-compute element addressing constants (same across all blocks) */
+    int group   = tid / 64;
+    int sub     = (tid % 64) / 32;   /* 0 = low nibble, 1 = high nibble */
+    int pos     = tid % 32;
+    int is      = group * 2 + sub;   /* sub-scale index 0..7 */
 
     float sum = 0.0f;
 
     for (int b = 0; b < nblocks; b++) {
-        /* Cooperatively load 256 x-values into shared memory */
         sx[tid] = __half2float(x[b * BLOCK_ELEMS + tid]);
         __syncthreads();
 
-        /* Each thread dequantises its element and accumulates */
-        const uint8_t *blk =
-            w + ((size_t)row * nblocks + b) * Q4K_BLOCK_BYTES;
-        sum += dequant_q4k_elem(blk, tid) * sx[tid];
+        const uint8_t *blk = w + ((size_t)row * nblocks + b) * Q4K_BLOCK_BYTES;
+
+        /* Read fp16 super-scales */
+        uint16_t d_raw    = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        uint16_t dmin_raw = (uint16_t)blk[2] | ((uint16_t)blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_raw));
+        float dmin = __half2float(__ushort_as_half(dmin_raw));
+
+        /* Read sub-scale/min — get_scale_min_k4 from ggml-quants.c */
+        const uint8_t *scales = blk + 4;
+        uint8_t sc, m;
+        if (is < 4) {
+            sc = scales[is]     & 63;
+            m  = scales[is + 4] & 63;
+        } else {
+            sc = (scales[is + 4] & 0x0F) | ((scales[is - 4] >> 6) << 4);
+            m  = (scales[is + 4] >>   4) | ((scales[is    ] >> 6) << 4);
+        }
+
+        /* Extract nibble */
+        const uint8_t *qs = blk + 16;
+        uint8_t qs_byte = qs[group * 32 + pos];
+        int nibble = (sub == 0) ? (qs_byte & 0xF) : (qs_byte >> 4);
+
+        /* FMA chain: fma(nibble, d*sc*x, fma(-m, dmin*x, sum))
+         * = nibble * d*sc*x + (-m * dmin*x) + sum
+         * = (d*sc*nibble - dmin*m) * x + sum  ✓  */
+        float xi = sx[tid];
+        sum = __fmaf_rn((float)nibble, d * (float)sc * xi,
+                        __fmaf_rn(-(float)m, dmin * xi, sum));
 
         __syncthreads();
     }
 
-    /* Reduce within each warp */
+    /* Warp + block reduction */
     sum = warp_reduce_sum(sum);
     if (lane == 0) warp_buf[warp] = sum;
     __syncthreads();
 
-    /* Reduce across warps — first warp finishes the job */
     if (warp == 0) {
         float v = (lane < 8) ? warp_buf[lane] : 0.0f;
         v = warp_reduce_sum(v);
@@ -193,7 +226,10 @@ __global__ void dequant_q4k_matvec(
 }
 
 /* ------------------------------------------------------------------ */
-/* Q6_K matvec kernel  (same structure as Q4_K)                       */
+/* Q6_K matvec kernel — FMA reformulation                              */
+/*                                                                      */
+/* Q6_K formula: d * sc * q  (signed q, no separate min term)         */
+/* FMA: fmaf(q, d*sc*x, sum) — single FMA per element.               */
 /* ------------------------------------------------------------------ */
 __global__ void dequant_q6k_matvec(
     const uint8_t * __restrict__ w,
@@ -204,13 +240,31 @@ __global__ void dequant_q6k_matvec(
     __shared__ float sx[BLOCK_ELEMS];
     __shared__ float warp_buf[8];
 
-    int row    = (int)blockIdx.x;
+    int row     = (int)blockIdx.x;
     if (row >= rows) return;
 
-    int tid    = (int)threadIdx.x;
-    int warp   = tid >> 5;
-    int lane   = tid & 31;
+    int tid     = (int)threadIdx.x;
+    int warp    = tid >> 5;
+    int lane    = tid & 31;
     int nblocks = cols / BLOCK_ELEMS;
+
+    /* Pre-compute element addressing constants */
+    int pass    = tid / 128;
+    int e_in    = tid % 128;
+    int sub     = e_in / 32;   /* 0..3 */
+    int l       = e_in % 32;
+    int is      = l / 16;      /* 0 or 1 within pass */
+    int ql_base = pass * 64;
+    int qh_base = pass * 32;
+    int sc_base = pass * 8;
+
+    int ql_idx, qh_shift, use_high_nibble;
+    if      (sub == 0) { ql_idx = ql_base + l;      qh_shift = 0; use_high_nibble = 0; }
+    else if (sub == 1) { ql_idx = ql_base + l + 32; qh_shift = 2; use_high_nibble = 0; }
+    else if (sub == 2) { ql_idx = ql_base + l;      qh_shift = 4; use_high_nibble = 1; }
+    else               { ql_idx = ql_base + l + 32; qh_shift = 6; use_high_nibble = 1; }
+
+    int sc_idx  = sc_base + is + sub * 2;
 
     float sum = 0.0f;
 
@@ -218,9 +272,24 @@ __global__ void dequant_q6k_matvec(
         sx[tid] = __half2float(x[b * BLOCK_ELEMS + tid]);
         __syncthreads();
 
-        const uint8_t *blk =
-            w + ((size_t)row * nblocks + b) * Q6K_BLOCK_BYTES;
-        sum += dequant_q6k_elem(blk, tid) * sx[tid];
+        const uint8_t *blk = w + ((size_t)row * nblocks + b) * Q6K_BLOCK_BYTES;
+
+        /* Read fp16 super-scale */
+        uint16_t d_raw = (uint16_t)blk[208] | ((uint16_t)blk[209] << 8);
+        float d = __half2float(__ushort_as_half(d_raw));
+
+        /* Extract 6-bit quantised value */
+        const uint8_t *ql = blk + 0;
+        const uint8_t *qh = blk + 128;
+        const int8_t  *sc = (const int8_t *)(blk + 192);
+
+        int nibble  = use_high_nibble ? (ql[ql_idx] >> 4) : (ql[ql_idx] & 0xF);
+        int qh_bits = (qh[qh_base + l] >> qh_shift) & 3;
+        int8_t q    = (int8_t)(nibble | (qh_bits << 4)) - 32;
+
+        /* FMA: fmaf(q, d*sc*x, sum) */
+        float xi = sx[tid];
+        sum = __fmaf_rn((float)q, d * (float)sc[sc_idx] * xi, sum);
 
         __syncthreads();
     }
