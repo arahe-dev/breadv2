@@ -5,7 +5,8 @@ BREAD is a high-performance custom inference engine for large Mixture-of-Experts
 ## Status
 
 **Correctness:** ✅ Verified — outputs correct answers ("Paris", "2+2=4", coherent multi-turn)
-**Performance:** 5.5–6.6 tok/s (baseline) → targeting 12–16 tok/s via optimization phases
+**Performance:** 6.2 tok/s (current) → targeting 12–20 tok/s via optimization phases
+**Profiling:** ✅ Bottleneck identified via NSight Systems (memory, not compute)
 **Architecture:** Custom C/CUDA engine with novel expert scheduling and memory-tier orchestration
 
 ## Quick Start
@@ -44,6 +45,29 @@ What is the capital of France?<|im_end|>
 .\bread.exe --server --tokens 256
 ```
 
+## Profiling Results (April 10, 2026)
+
+**Bottleneck Analysis via NVIDIA NSight Systems:**
+
+| Component | Time | % | Finding |
+|-----------|------|---|---------|
+| H2D Memory Transfers | 7.53s | 20.4% | 🔴 **PRIMARY bottleneck** |
+| CUDA Synchronization | 2.88s | 7.8% | Secondary |
+| cudaMalloc/Free | 4.11s | 11.2% | Tertiary |
+| **GPU Compute** | **3.16s** | **8.6%** | **NOT the bottleneck** |
+
+**Key Finding:** GPU kernels (Q4_K, Q6_K matvecs) run very efficiently (53.3% + 44.2% of compute time). The bottleneck is **expert weight loading from host RAM to VRAM due to 8GB VRAM constraint** (expert weights total 20GB, can only cache 18 expert slots at a time).
+
+**Root Causes Identified:**
+1. Expert weights are 20GB, VRAM is 8GB → can't fit all experts resident
+2. LRU cache with 18 slots cannot help with random expert access (93% miss rate)
+3. 32,424 Host→Device transfers totaling 7.53 seconds of overhead
+4. Expert computation runs serially on `stream_a`, could theoretically parallelize but temporary buffers create race conditions
+
+**Documentation:** See [PROFILING_ANALYSIS.md](PROFILING_ANALYSIS.md) and [PROFILING_FINDINGS_SUMMARY.md](PROFILING_FINDINGS_SUMMARY.md) for detailed analysis.
+
+---
+
 ## Architecture
 
 ### Core Components
@@ -69,13 +93,32 @@ What is the capital of France?<|im_end|>
 | Phase 7 | AGENCY tool-calling | ✅ Complete | Hermes format support |
 | Phase 8 | FloE expert compression | 📋 Research phase | +2-4 tok/s target |
 
-### Optimization Roadmap
+### Optimization Roadmap (Post-Profiling)
 
-**Next (Week 1-2):** Complete Phase 6 (FMA), implement SSM AVX2 vectorization, CPU expert execution
-**Target:** 8–10 tok/s
-**Then:** Evaluate FloE compression for 12–16 tok/s ceiling
+Based on profiling findings, three paths are available to reduce memory bandwidth bottleneck:
 
-See [PAPER_ANALYSIS_REPORT.md](PAPER_ANALYSIS_REPORT.md) for detailed research on next-generation optimizations.
+**Path A: Safe + Moderate Gains (Recommended First)**
+- Overlap DMA with GPU computation using dual streams
+- Reduce synchronization overhead (5,786 cudaStreamSynchronize calls)
+- Time: 3-4 hours | Gain: 30-40% (→ 8.5 tok/s)
+- Confidence: High | Risk: Low
+
+**Path B: Aggressive + High Gains**
+- Implement expert compression (FloE pattern: lossy quantization)
+- Compress 20GB experts → 2-3GB, cache full set in VRAM
+- Time: 8-10 hours | Gain: 60-140% (→ 12-15 tok/s)
+- Confidence: Medium | Risk: High (numeric precision)
+
+**Path C: Proven + Robust**
+- Implement SSD streaming infrastructure (already designed in codebase)
+- Async expert loading while computing previous layers
+- Can be combined with Path B for hybrid approach
+- Time: 6-8 hours | Gain: 30-60% (→ 8-10 tok/s sustained)
+- Confidence: Med-High | Risk: Medium (complex orchestration)
+
+**Recommended Strategy:** Implement Path C first (uses existing infrastructure), then add Path B (expert compression) on top for 2.5-3x total speedup.
+
+See [PROFILING_ANALYSIS.md](PROFILING_ANALYSIS.md) for detailed technical analysis and [PAPER_ANALYSIS_REPORT.md](PAPER_ANALYSIS_REPORT.md) for research on next-generation optimizations.
 
 ## Implementation Highlights
 
@@ -91,22 +134,27 @@ See [PAPER_ANALYSIS_REPORT.md](PAPER_ANALYSIS_REPORT.md) for detailed research o
 ✅ Metadata-driven runtime config (parsed from GGUF headers)
 ✅ AGENCY tool-calling agent with Hermes format
 
-### Known Bottlenecks
+### Known Bottlenecks (from Profiling)
 
-1. **GPU kernel efficiency** (Phase 6: FMA dequant)
-   - Current: Separate dequant-then-multiply, separate instructions
-   - Target: Fused multiply-add chains, fewer dependent instructions
-   - Expected gain: +10-12% on GPU matvec
+1. **Expert Weight Loading from Host RAM (PRIMARY: 20.4% of total time)**
+   - Problem: 32,424 Host→Device transfers (7.53 seconds) due to 8GB VRAM < 20GB expert weights
+   - Root cause: LRU cache with 18 slots → 93% cache miss rate on random expert access
+   - Solution options:
+     - Path B: Compress experts (FloE) → fit all in VRAM
+     - Path C: SSD streaming + orchestration
+   - Expected gain: +60-140% or +30-60% respectively
 
-2. **SSM recurrence (30 layers)**
-   - Current: Scalar unoptimized CPU loop, 15-30 ms/token
-   - Target: AVX2 SIMD vectorization
-   - Expected gain: 2–3× speedup, +0.5-1 tok/s
+2. **Serialized Expert Computation (Architectural constraint)**
+   - Problem: All 8 experts run on `stream_a` sequentially (4ms per layer)
+   - Root cause: Shared temporary buffers (d_eg, d_eu, d_eo) prevent parallelization
+   - Could parallelize to 0.5ms per layer (8x faster) but requires 8x more temp buffers
+   - Blocked by VRAM constraints
+   - Workaround: Focus on overlapping DMA with existing computation (Path A/C)
 
-3. **Expert DMA latency**
-   - Current: 8 experts × 40 layers × ~1-2 ms per expert = 160 ms/token
-   - Target: CPU-side expert execution (arithmetic intensity argument) OR FloE compression
-   - Expected gain: +1-4 tok/s
+3. **Synchronization Overhead (7.8% of total time)**
+   - Problem: 5,786 cudaStreamSynchronize calls creating hard barriers
+   - Many could be replaced with CUDA events for fine-grained dependencies
+   - Expected gain: 2-3% speedup via Path A
 
 ## Hardware & Configuration
 
@@ -175,12 +223,35 @@ Total: ~63 seconds (includes 20s model load)
 
 See benchmark logs in `bench_*.log` files for detailed runs.
 
-## Next Steps
+## Next Steps (Post-Profiling)
 
-1. **Benchmark Phase 6 FMA kernel** — verify +10-12% gain (currently marked "implemented, pending build")
-2. **Implement SSM AVX2 vectorization** — expected +0.5-1 tok/s in 6 hours
-3. **Add CPU-side expert execution** — expected +1-2 tok/s in 10 hours
-4. **Evaluate FloE compression** — only if above reach 8-10 tok/s plateau
+### Immediate (Choose One Path)
+
+1. **Path A: DMA Overlap + Sync Optimization** (if you want quick 30-40% gain)
+   - Verify buffer pool is fully wired
+   - Overlap expert DMA with computation using dual streams
+   - Replace hard syncs with events
+   - Timeline: 3-4 hours → 8.5 tok/s
+
+2. **Path C: SSD Streaming** (if you want infrastructure-first approach)
+   - Implement async expert loading while computing
+   - Use existing loader infrastructure
+   - Can be combined with Path B later
+   - Timeline: 6-8 hours → 8-10 tok/s
+
+3. **Path B: Expert Compression** (if you want aggressive high gains)
+   - Implement lossy expert quantization
+   - Cache full expert set in VRAM
+   - Timeline: 8-10 hours → 12-15 tok/s
+   - Risk: numeric precision (test aggressively)
+
+### Then (Recommended Combo)
+
+Implement **Path C + Path B together** for 2.5-3x total speedup:
+- Path C provides orchestration infrastructure (async DMA, events, streams)
+- Path B provides compression (fit all experts in VRAM)
+- Together: 6.2 → 15-20 tok/s
+- Timeline: 14 hours | High confidence in combination
 
 ## References
 
@@ -203,5 +274,5 @@ MIT (pending formalization)
 
 ---
 
-**Last updated:** 2026-04-08
+**Last updated:** 2026-04-10 (NSight profiling complete, optimization roadmap updated)
 **Maintainer:** [BREAD Project](https://github.com/yourusername/bread_v2)
