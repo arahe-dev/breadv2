@@ -378,6 +378,7 @@ int main(int argc, char **argv)
     int         disable_rope = 0;
     int         prefetch_mode = 0;
     int         ssd_streaming_mode = 0;
+    int         cpu_experts_mode = 0;
     int         server_mode = 0;
     int         hooks_debug = 0;
     int         no_progress = 0;
@@ -395,6 +396,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--disable-rope"))   disable_rope = 1;
         else if (!strcmp(argv[i], "--prefetch")) prefetch_mode = 1;
         else if (!strcmp(argv[i], "--ssd-streaming")) ssd_streaming_mode = 1;
+        else if (!strcmp(argv[i], "--cpu-experts")) cpu_experts_mode = 1;
         else if (!strcmp(argv[i], "--server"))  server_mode = 1;
         else if (!strcmp(argv[i], "--hooks-debug")) hooks_debug = 1;
         else if (!strcmp(argv[i], "--no-progress")) no_progress = 1;
@@ -408,6 +410,7 @@ int main(int argc, char **argv)
     bread_set_trace_pos(-1);
     bread_set_prefetch_mode(prefetch_mode);
     bread_set_ssd_streaming_mode(ssd_streaming_mode);
+    bread_set_cpu_experts_mode(cpu_experts_mode);
 
     /* Initialize progress tracking with default callback */
     if (!no_progress) {
@@ -455,14 +458,20 @@ int main(int argc, char **argv)
     /* -- Pre-load all expert weights to VRAM cache ------------------- */
     /* In default mode: pre-cache all experts at startup for fast access
        In SSD streaming mode: skip pre-cache, load experts on-demand for DMA overlap */
-    if (!ssd_streaming_mode) {
+    if (!ssd_streaming_mode && !cpu_experts_mode) {
         if (!server_mode) printf("      Loading expert weights to VRAM...\n");
         if (weight_cache_load_experts(wc, L, cfg->num_layers) != 0) {
             fprintf(stderr, "weight_cache_load_experts failed\n");
             return 1;
         }
     } else {
-        if (!server_mode) printf("      SSD streaming mode: expert weights loaded on-demand\n");
+        if (!server_mode) {
+            if (cpu_experts_mode) {
+                printf("      CPU experts mode: routed experts run from host RAM\n");
+            } else {
+                printf("      SSD streaming mode: expert weights loaded on-demand\n");
+            }
+        }
     }
 
     /* -- Pre-allocate layer computation buffers ---------------------- */

@@ -31,6 +31,9 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "bread.h"
 #include "gguf.h"
@@ -1050,6 +1053,10 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     static half  *h_attn_half_buf = NULL;
     static int   *h_expert_indices = NULL;
     static float *h_expert_weights = NULL;
+    static float *h_cpu_expert_delta = NULL;
+    static float *h_cpu_thread_out[8] = {NULL};
+    static float *h_cpu_thread_gate[8] = {NULL};
+    static float *h_cpu_thread_up[8] = {NULL};
 
     /* Pipelined routing: compute at layer N-1 end, use at layer N start */
     static int   *h_expert_indices_current = NULL;
@@ -1182,6 +1189,20 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                     fprintf(stderr, "one_layer_forward: SSM state alloc failed for layer %d\n", layer);
                     exit(1);
                 }
+            }
+        }
+        h_cpu_expert_delta = (float *)malloc(H * sizeof(float));
+        if (!h_cpu_expert_delta) {
+            fprintf(stderr, "one_layer_forward: CPU expert delta alloc failed\n");
+            exit(1);
+        }
+        for (int k = 0; k < 8; k++) {
+            h_cpu_thread_out[k] = (float *)malloc(H * sizeof(float));
+            h_cpu_thread_gate[k] = (float *)malloc(cfg->expert_inter * sizeof(float));
+            h_cpu_thread_up[k] = (float *)malloc(cfg->expert_inter * sizeof(float));
+            if (!h_cpu_thread_out[k] || !h_cpu_thread_gate[k] || !h_cpu_thread_up[k]) {
+                fprintf(stderr, "one_layer_forward: CPU expert scratch alloc failed\n");
+                exit(1);
             }
         }
         initialized = 1;
@@ -1928,61 +1949,95 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             loader_sync(L);  /* Wait for DMA to complete */
         }
 
-        for (int k = 0; k < cfg->top_k; k++) {
-            int expert_idx = active_expert_indices[k];
-
-            void *d_gate = NULL;
-            void *d_up = NULL;
-            void *d_down = NULL;
-
-            /* Load expert weights from either pre-cache or on-demand */
-            if (bread_get_ssd_streaming_mode()) {
-                /* SSD streaming mode: load experts on-demand from loader */
-                if (!L) {
-                    fprintf(stderr, "ERROR: loader not initialized in streaming mode\n");
-                    continue;
-                }
-                expert_ptrs_t ptrs = loader_get_expert(L, layer_idx, expert_idx);
-                d_gate = ptrs.gate;
-                d_up = ptrs.up;
-                d_down = ptrs.down;
-                if (!d_gate || !d_up || !d_down) {
-                    fprintf(stderr, "ERROR: expert (%d,%d) not loaded by loader\n",
-                            layer_idx, expert_idx);
-                    continue;
-                }
+        if (bread_get_cpu_experts_mode()) {
+            if (!L || !L->layers[layer_idx].valid) {
+                fprintf(stderr, "ERROR: CPU experts mode requires valid host expert tensors for layer %d\n", layer_idx);
             } else {
-                /* Default mode: use pre-cached weights from weight_cache */
-                if (!wc || !wc->layers[layer_idx].experts.gate_ptrs) {
-                    fprintf(stderr, "ERROR: expert weights not cached (wc=%p)\n", wc);
-                    continue;
+                const loader_layer_info_t *li = &L->layers[layer_idx];
+                vram_half_to_cpu_float(d_normed2, h_normed2, H);
+                memset(h_cpu_expert_delta, 0, H * sizeof(float));
+#pragma omp parallel for schedule(static, 1) num_threads(8)
+                for (int k = 0; k < cfg->top_k; k++) {
+                    const int expert_idx = active_expert_indices[k];
+                    float *tmp_out = h_cpu_thread_out[k];
+                    float *tmp_gate = h_cpu_thread_gate[k];
+                    float *tmp_up = h_cpu_thread_up[k];
+                    const uint8_t *gate_src = li->gate_base + (uint64_t)expert_idx * li->gate_expert_bytes;
+                    const uint8_t *up_src = li->up_base + (uint64_t)expert_idx * li->up_expert_bytes;
+                    const uint8_t *down_src = li->down_base + (uint64_t)expert_idx * li->down_expert_bytes;
+                    cpu_tensor_matvec(gate_src, li->gate_type, h_normed2, tmp_gate, cfg->expert_inter, H);
+                    cpu_tensor_matvec(up_src, li->up_type, h_normed2, tmp_up, cfg->expert_inter, H);
+                    cpu_swiglu(tmp_gate, tmp_up, tmp_gate, cfg->expert_inter);
+                    cpu_tensor_matvec(down_src, li->down_type, tmp_gate, tmp_out, H, cfg->expert_inter);
+                    for (int i = 0; i < H; i++) tmp_out[i] *= active_expert_weights[k];
                 }
-                d_gate = wc->layers[layer_idx].experts.gate_ptrs[expert_idx];
-                d_up = wc->layers[layer_idx].experts.up_ptrs[expert_idx];
-                d_down = wc->layers[layer_idx].experts.down_ptrs[expert_idx];
+                for (int k = 0; k < cfg->top_k; k++) {
+                    float *tmp_out = h_cpu_thread_out[k];
+                    for (int i = 0; i < H; i++) h_cpu_expert_delta[i] += tmp_out[i];
+                }
+                for (int i = 0; i < H; i++) h_hidden_half[i] = __float2half(h_cpu_expert_delta[i]);
+                CUDA_CHECK(cudaMemcpyAsync(d_eo, h_hidden_half, H * sizeof(half),
+                                           cudaMemcpyHostToDevice, stream_a));
+                scale_accum<<<n_blocks_h, 256, 0, stream_a>>>(d_hidden, d_eo, 1.0f, H);
+                CUDA_CHECK(cudaStreamSynchronize(stream_a));
             }
+        } else {
+            for (int k = 0; k < cfg->top_k; k++) {
+                int expert_idx = active_expert_indices[k];
 
-            /* gate/up projections: normed2[H] → gate/up[EXPERT_INTER] */
-            bread_matvec(d_gate, d_normed2, d_eg,
-                         cfg->expert_inter, H, GGML_TYPE_Q4_K, stream_a);
-            bread_matvec(d_up,  d_normed2, d_eu,
-                         cfg->expert_inter, H, GGML_TYPE_Q4_K, stream_a);
+                void *d_gate = NULL;
+                void *d_up = NULL;
+                void *d_down = NULL;
 
-            /* SwiGLU in-place on gate */
-            silu_mul_inplace<<<n_blocks_ei, 256, 0, stream_a>>>(
-                d_eg, d_eu, cfg->expert_inter);
+                /* Load expert weights from either pre-cache or on-demand */
+                if (bread_get_ssd_streaming_mode()) {
+                    /* SSD streaming mode: load experts on-demand from loader */
+                    if (!L) {
+                        fprintf(stderr, "ERROR: loader not initialized in streaming mode\n");
+                        continue;
+                    }
+                    expert_ptrs_t ptrs = loader_get_expert(L, layer_idx, expert_idx);
+                    d_gate = ptrs.gate;
+                    d_up = ptrs.up;
+                    d_down = ptrs.down;
+                    if (!d_gate || !d_up || !d_down) {
+                        fprintf(stderr, "ERROR: expert (%d,%d) not loaded by loader\n",
+                                layer_idx, expert_idx);
+                        continue;
+                    }
+                } else {
+                    /* Default mode: use pre-cached weights from weight_cache */
+                    if (!wc || !wc->layers[layer_idx].experts.gate_ptrs) {
+                        fprintf(stderr, "ERROR: expert weights not cached (wc=%p)\n", wc);
+                        continue;
+                    }
+                    d_gate = wc->layers[layer_idx].experts.gate_ptrs[expert_idx];
+                    d_up = wc->layers[layer_idx].experts.up_ptrs[expert_idx];
+                    d_down = wc->layers[layer_idx].experts.down_ptrs[expert_idx];
+                }
 
-            /* down projection: gate[EXPERT_INTER] → expert_out[H] */
-            bread_matvec(d_down, d_eg, d_eo,
-                         H, cfg->expert_inter, GGML_TYPE_Q6_K, stream_a);
+                /* gate/up projections: normed2[H] → gate/up[EXPERT_INTER] */
+                bread_matvec(d_gate, d_normed2, d_eg,
+                             cfg->expert_inter, H, GGML_TYPE_Q4_K, stream_a);
+                bread_matvec(d_up,  d_normed2, d_eu,
+                             cfg->expert_inter, H, GGML_TYPE_Q4_K, stream_a);
 
-            /* Weighted accumulate into hidden */
-            scale_accum<<<n_blocks_h, 256, 0, stream_a>>>(
-                d_hidden, d_eo, active_expert_weights[k], H);
-            /* No intermediate syncs — all on same stream, GPU handles ordering */
+                /* SwiGLU in-place on gate */
+                silu_mul_inplace<<<n_blocks_ei, 256, 0, stream_a>>>(
+                    d_eg, d_eu, cfg->expert_inter);
+
+                /* down projection: gate[EXPERT_INTER] → expert_out[H] */
+                bread_matvec(d_down, d_eg, d_eo,
+                             H, cfg->expert_inter, GGML_TYPE_Q6_K, stream_a);
+
+                /* Weighted accumulate into hidden */
+                scale_accum<<<n_blocks_h, 256, 0, stream_a>>>(
+                    d_hidden, d_eo, active_expert_weights[k], H);
+                /* No intermediate syncs — all on same stream, GPU handles ordering */
+            }
+            /* Flush all expert kernels to GPU (single sync instead of per-expert) */
+            CUDA_CHECK(cudaStreamSynchronize(stream_a));
         }
-        /* Flush all expert kernels to GPU (single sync instead of per-expert) */
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
     }
 
     /* ================================================================
