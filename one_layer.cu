@@ -1056,6 +1056,8 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     static float *h_expert_weights_current = NULL;
     static int   *h_expert_indices_next = NULL;
     static float *h_expert_weights_next = NULL;
+    static int    h_expert_current_valid = 0;
+    static int    h_expert_next_valid = 0;
 
     static float *h_logits = NULL;
 
@@ -1082,6 +1084,8 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             fprintf(stderr, "one_layer_forward: failed to allocate pipelined routing buffers\n");
             exit(1);
         }
+        h_expert_current_valid = 0;
+        h_expert_next_valid = 0;
     }
 
     /* Alias device and host buffers from pool on every call
@@ -1853,6 +1857,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     if (bread_get_ssd_streaming_mode() && layer_idx == 0 && h_expert_indices_current) {
         memcpy(h_expert_indices_current, expert_indices, (size_t)cfg->top_k * sizeof(int));
         memcpy(h_expert_weights_current, expert_weights, (size_t)cfg->top_k * sizeof(float));
+        h_expert_current_valid = 1;
     }
 
     /* Sync stream_a for shared gate+up (should complete in ~8 μs, routing took ~500 μs → 0 wait) */
@@ -1895,7 +1900,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
      * this layer's computation on stream_a, hiding DMA latency.
      * ================================================================ */
     if (bread_get_ssd_streaming_mode() && L && layer_idx >= 0 &&
-        layer_idx + 1 < cfg->num_layers && h_expert_indices_next) {
+        layer_idx + 1 < cfg->num_layers && h_expert_indices_next && h_expert_next_valid) {
         loader_request_on_stream(L, layer_idx + 1, h_expert_indices_next,
                                  cfg->top_k, L->stream_c);
     }
@@ -1912,7 +1917,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         int *active_expert_indices = expert_indices;
         float *active_expert_weights = expert_weights;
 
-        if (bread_get_ssd_streaming_mode() && h_expert_indices_current) {
+        if (bread_get_ssd_streaming_mode() && h_expert_indices_current && h_expert_current_valid) {
             active_expert_indices = h_expert_indices_current;
             active_expert_weights = h_expert_weights_current;
         }
@@ -1992,6 +1997,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
            This is the standard routing input for MoE FFN. */
         route_layer(L, g, layer_idx + 1, d_normed2,
                     h_expert_indices_next, h_expert_weights_next);
+        h_expert_next_valid = 1;
     }
 
     /* ================================================================
@@ -2013,6 +2019,8 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         h_expert_weights_current = h_expert_weights_next;
         h_expert_indices_next = tmp_idx;
         h_expert_weights_next = tmp_wt;
+        h_expert_current_valid = h_expert_next_valid;
+        h_expert_next_valid = 0;
     }
 
     /* d_hidden now contains the full transformer block output */

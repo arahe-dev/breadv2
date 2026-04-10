@@ -6,10 +6,10 @@ echo === Building bread.exe ===
 
 nvcc -O2 ^
      -x cu ^
-     main.cu one_layer.cu kernels.cu loader.c gguf.c tokenizer.c bread.c ^
+     main.cu one_layer.cu kernels.cu loader.c gguf.c tokenizer.c bread.c layer_ops.cu expert_bench.cu hooks.c progress_tracking.c buffer_pool.c ^
      -I. ^
      -o bread.exe ^
-     -Xcompiler /W3
+     -Xcompiler "/W3 /openmp"
 
 if errorlevel 1 (
     echo FAILED: compile error

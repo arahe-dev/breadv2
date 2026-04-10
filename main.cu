@@ -64,6 +64,9 @@ extern float one_layer_last_branch_rms(void);
 /* kernels.cu */
 extern void bread_matvec(void *w, half *x, half *y,
                           int rows, int cols, int qtype, cudaStream_t stream);
+extern int bread_benchmark_expert_block(const bread_model_config_t *cfg,
+                                        const loader_t *L,
+                                        const weight_cache_t *wc);
 
 /* ------------------------------------------------------------------ */
 /* Q4K constants (must match kernels.cu)                               */
@@ -378,6 +381,7 @@ int main(int argc, char **argv)
     int         server_mode = 0;
     int         hooks_debug = 0;
     int         no_progress = 0;
+    int         bench_experts = 0;
 
     /* -- Parse args ------------------------------------------------- */
     for (int i = 1; i < argc; i++) {
@@ -394,6 +398,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--server"))  server_mode = 1;
         else if (!strcmp(argv[i], "--hooks-debug")) hooks_debug = 1;
         else if (!strcmp(argv[i], "--no-progress")) no_progress = 1;
+        else if (!strcmp(argv[i], "--bench-experts")) bench_experts = 1;
     }
 
     bread_set_boring_mode(minimal_mode);
@@ -465,6 +470,14 @@ int main(int argc, char **argv)
     if (bread_buffer_pool_init(cfg) != 0) {
         fprintf(stderr, "bread_buffer_pool_init failed\n");
         return 1;
+    }
+
+    if (bench_experts) {
+        int rc = bread_benchmark_expert_block(cfg, L, wc);
+        bread_buffer_pool_free();
+        weight_cache_free(wc);
+        loader_free(L);
+        return rc;
     }
 
     /* -- Load tokenizer --------------------------------------------- */
