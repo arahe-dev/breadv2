@@ -23,6 +23,7 @@ static int g_disable_rope = 0;
 static int g_trace_debug = 0;
 static int g_trace_pos = -1;
 static int g_prefetch_mode = 0;  /* Layer prefetch optimization (off by default) */
+static int g_ssd_streaming_mode = 0;  /* SSD streaming mode (off by default) */
 
 static void xread(FILE *fp, void *buf, size_t n) {
     if (fread(buf, 1, n, fp) != n) {
@@ -382,4 +383,14 @@ void bread_set_prefetch_mode(int enabled)
 int bread_get_prefetch_mode(void)
 {
     return g_prefetch_mode;
+}
+
+void bread_set_ssd_streaming_mode(int enabled)
+{
+    g_ssd_streaming_mode = enabled ? 1 : 0;
+}
+
+int bread_get_ssd_streaming_mode(void)
+{
+    return g_ssd_streaming_mode;
 }

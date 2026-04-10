@@ -374,6 +374,7 @@ int main(int argc, char **argv)
     int         force_ssm_zero = 0;
     int         disable_rope = 0;
     int         prefetch_mode = 0;
+    int         ssd_streaming_mode = 0;
     int         server_mode = 0;
     int         hooks_debug = 0;
     int         no_progress = 0;
@@ -389,6 +390,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--force-ssm-zero")) force_ssm_zero = 1;
         else if (!strcmp(argv[i], "--disable-rope"))   disable_rope = 1;
         else if (!strcmp(argv[i], "--prefetch")) prefetch_mode = 1;
+        else if (!strcmp(argv[i], "--ssd-streaming")) ssd_streaming_mode = 1;
         else if (!strcmp(argv[i], "--server"))  server_mode = 1;
         else if (!strcmp(argv[i], "--hooks-debug")) hooks_debug = 1;
         else if (!strcmp(argv[i], "--no-progress")) no_progress = 1;
@@ -400,6 +402,7 @@ int main(int argc, char **argv)
     bread_set_trace_debug(debug_rms);
     bread_set_trace_pos(-1);
     bread_set_prefetch_mode(prefetch_mode);
+    bread_set_ssd_streaming_mode(ssd_streaming_mode);
 
     /* Initialize progress tracking with default callback */
     if (!no_progress) {
@@ -445,10 +448,16 @@ int main(int argc, char **argv)
     if (!wc) { fprintf(stderr, "weight_cache_init failed\n"); return 1; }
 
     /* -- Pre-load all expert weights to VRAM cache ------------------- */
-    if (!server_mode) printf("      Loading expert weights to VRAM...\n");
-    if (weight_cache_load_experts(wc, L, cfg->num_layers) != 0) {
-        fprintf(stderr, "weight_cache_load_experts failed\n");
-        return 1;
+    /* In default mode: pre-cache all experts at startup for fast access
+       In SSD streaming mode: skip pre-cache, load experts on-demand for DMA overlap */
+    if (!ssd_streaming_mode) {
+        if (!server_mode) printf("      Loading expert weights to VRAM...\n");
+        if (weight_cache_load_experts(wc, L, cfg->num_layers) != 0) {
+            fprintf(stderr, "weight_cache_load_experts failed\n");
+            return 1;
+        }
+    } else {
+        if (!server_mode) printf("      SSD streaming mode: expert weights loaded on-demand\n");
     }
 
     /* -- Pre-allocate layer computation buffers ---------------------- */

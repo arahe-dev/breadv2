@@ -1050,6 +1050,13 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     static half  *h_attn_half_buf = NULL;
     static int   *h_expert_indices = NULL;
     static float *h_expert_weights = NULL;
+
+    /* Pipelined routing: compute at layer N-1 end, use at layer N start */
+    static int   *h_expert_indices_current = NULL;
+    static float *h_expert_weights_current = NULL;
+    static int   *h_expert_indices_next = NULL;
+    static float *h_expert_weights_next = NULL;
+
     static float *h_logits = NULL;
 
     float *&h_hidden = g_h_hidden;  /* alias to file-scope for RMS access */
@@ -1060,6 +1067,19 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         pool = bread_buffer_pool_get();
         if (!pool) {
             fprintf(stderr, "one_layer_forward: buffer pool not initialized\n");
+            exit(1);
+        }
+    }
+
+    /* Initialize pipelined routing buffers if SSD streaming mode enabled */
+    if (bread_get_ssd_streaming_mode() && !h_expert_indices_current) {
+        h_expert_indices_current = (int *)malloc((size_t)cfg->top_k * sizeof(int));
+        h_expert_weights_current = (float *)malloc((size_t)cfg->top_k * sizeof(float));
+        h_expert_indices_next = (int *)malloc((size_t)cfg->top_k * sizeof(int));
+        h_expert_weights_next = (float *)malloc((size_t)cfg->top_k * sizeof(float));
+        if (!h_expert_indices_current || !h_expert_weights_current ||
+            !h_expert_indices_next || !h_expert_weights_next) {
+            fprintf(stderr, "one_layer_forward: failed to allocate pipelined routing buffers\n");
             exit(1);
         }
     }
@@ -1829,6 +1849,12 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     float shared_gate_score = route_layer(L, g, layer_idx, d_normed2,
                                            expert_indices, expert_weights);
 
+    /* In SSD streaming mode, initialize h_expert_indices_current for layer 0 */
+    if (bread_get_ssd_streaming_mode() && layer_idx == 0 && h_expert_indices_current) {
+        memcpy(h_expert_indices_current, expert_indices, (size_t)cfg->top_k * sizeof(int));
+        memcpy(h_expert_weights_current, expert_weights, (size_t)cfg->top_k * sizeof(float));
+    }
+
     /* Sync stream_a for shared gate+up (should complete in ~8 μs, routing took ~500 μs → 0 wait) */
     CUDA_CHECK(cudaStreamSynchronize(stream_a));
     if (!wc) { cudaFree(d_sg_w); cudaFree(d_su_w); }
@@ -1863,25 +1889,73 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     }
 
     /* ================================================================
+     * PIPELINED PREFETCH: Fire next layer's expert DMA on stream_c
+     *
+     * In SSD streaming mode, load next layer's experts in parallel with
+     * this layer's computation on stream_a, hiding DMA latency.
+     * ================================================================ */
+    if (bread_get_ssd_streaming_mode() && L && layer_idx >= 0 &&
+        layer_idx + 1 < cfg->num_layers && h_expert_indices_next) {
+        loader_request_on_stream(L, layer_idx + 1, h_expert_indices_next,
+                                 cfg->top_k, L->stream_c);
+    }
+
+    /* ================================================================
      * CMD3b: K active expert forwards → weighted accumulate into hidden
-     * All expert weights are pre-cached in wc->layers[layer_idx].experts
      * ================================================================ */
     {
         int n_blocks_ei = (cfg->expert_inter + 255) / 256;
         int n_blocks_h  = (H + 255) / 256;
 
+        /* In SSD streaming mode, use pre-computed routing from previous layer
+           Otherwise compute routing on-the-fly */
+        int *active_expert_indices = expert_indices;
+        float *active_expert_weights = expert_weights;
+
+        if (bread_get_ssd_streaming_mode() && h_expert_indices_current) {
+            active_expert_indices = h_expert_indices_current;
+            active_expert_weights = h_expert_weights_current;
+        }
+
+        /* In SSD streaming mode, load required experts from host RAM before using them */
+        if (bread_get_ssd_streaming_mode() && L) {
+            loader_request(L, layer_idx, active_expert_indices, cfg->top_k);
+            loader_sync(L);  /* Wait for DMA to complete */
+        }
+
         for (int k = 0; k < cfg->top_k; k++) {
-            int expert_idx = expert_indices[k];
+            int expert_idx = active_expert_indices[k];
 
-            /* Retrieve pre-cached expert weights from VRAM */
-            if (!wc || !wc->layers[layer_idx].experts.gate_ptrs) {
-                fprintf(stderr, "ERROR: expert weights not cached (wc=%p)\n", wc);
-                continue;
+            void *d_gate = NULL;
+            void *d_up = NULL;
+            void *d_down = NULL;
+
+            /* Load expert weights from either pre-cache or on-demand */
+            if (bread_get_ssd_streaming_mode()) {
+                /* SSD streaming mode: load experts on-demand from loader */
+                if (!L) {
+                    fprintf(stderr, "ERROR: loader not initialized in streaming mode\n");
+                    continue;
+                }
+                expert_ptrs_t ptrs = loader_get_expert(L, layer_idx, expert_idx);
+                d_gate = ptrs.gate;
+                d_up = ptrs.up;
+                d_down = ptrs.down;
+                if (!d_gate || !d_up || !d_down) {
+                    fprintf(stderr, "ERROR: expert (%d,%d) not loaded by loader\n",
+                            layer_idx, expert_idx);
+                    continue;
+                }
+            } else {
+                /* Default mode: use pre-cached weights from weight_cache */
+                if (!wc || !wc->layers[layer_idx].experts.gate_ptrs) {
+                    fprintf(stderr, "ERROR: expert weights not cached (wc=%p)\n", wc);
+                    continue;
+                }
+                d_gate = wc->layers[layer_idx].experts.gate_ptrs[expert_idx];
+                d_up = wc->layers[layer_idx].experts.up_ptrs[expert_idx];
+                d_down = wc->layers[layer_idx].experts.down_ptrs[expert_idx];
             }
-
-            void *d_gate = wc->layers[layer_idx].experts.gate_ptrs[expert_idx];
-            void *d_up   = wc->layers[layer_idx].experts.up_ptrs[expert_idx];
-            void *d_down = wc->layers[layer_idx].experts.down_ptrs[expert_idx];
 
             /* gate/up projections: normed2[H] → gate/up[EXPERT_INTER] */
             bread_matvec(d_gate, d_normed2, d_eg,
@@ -1899,7 +1973,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
             /* Weighted accumulate into hidden */
             scale_accum<<<n_blocks_h, 256, 0, stream_a>>>(
-                d_hidden, d_eo, expert_weights[k], H);
+                d_hidden, d_eo, active_expert_weights[k], H);
             /* No intermediate syncs — all on same stream, GPU handles ordering */
         }
         /* Flush all expert kernels to GPU (single sync instead of per-expert) */
@@ -1907,49 +1981,38 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     }
 
     /* ================================================================
-     * Phase 5: Prefetch next layer's experts (dual-stream optimization)
+     * ROUTING FOR NEXT LAYER (Pipelined)
      *
-     * If prefetch mode enabled, not last layer, and not in boring mode:
-     * Route for layer+1 using current d_hidden (post-FFN, pre-next-attn).
-     * Fire loader_request on stream_c so layer+1 experts load in background.
-     * Note: prefetch adds ~10ms overhead per layer, beneficial for longer
-     * sequences with more DMA overlap (>100 tokens), hurts short sequences.
+     * Compute routing at end of this layer, for use at START of next layer.
+     * CPU work (routing matmul + softmax + topK) happens off critical path
+     * while prefetch DMA runs on stream_c.
      * ================================================================ */
-    if (bread_get_prefetch_mode() && layer_idx + 1 < cfg->num_layers &&
-        !bread_get_boring_mode()) {
-        static int   *h_next_expert_indices = NULL;
-        static float *h_next_expert_weights = NULL;
-        if (!h_next_expert_indices) {
-            h_next_expert_indices = (int *)malloc((size_t)cfg->top_k * sizeof(int));
-            h_next_expert_weights = (float *)malloc((size_t)cfg->top_k * sizeof(float));
-        }
+    if (bread_get_ssd_streaming_mode() && layer_idx + 1 < cfg->num_layers) {
+        /* Use d_normed2 (post-attn norm hidden state) for routing.
+           This is the standard routing input for MoE FFN. */
+        route_layer(L, g, layer_idx + 1, d_normed2,
+                    h_expert_indices_next, h_expert_weights_next);
+    }
 
-        /* For prefetching: route_layer requires post-attn norm input.
-         * We have d_hidden (post-FFN), but need post-attn norm of next layer.
-         * Instead, fire a basic prefetch for next layer's routing on stream_c.
-         * Create a temp normalized version of d_hidden for routing.
-         */
-        static half *d_normed_prefetch = NULL;
-        if (!d_normed_prefetch) {
-            CUDA_CHECK(cudaMalloc(&d_normed_prefetch, (size_t)H * sizeof(half)));
-        }
+    /* ================================================================
+     * SYNC: Wait for compute and prefetch to complete
+     * ================================================================ */
+    CUDA_CHECK(cudaStreamSynchronize(stream_a));
+    if (bread_get_ssd_streaming_mode() && L) {
+        loader_sync(L);  /* Waits for stream_c prefetch DMA to complete */
+    }
 
-        /* Copy d_hidden → d_normed_prefetch and normalize */
-        int blocks = (H + 255) / 256;
-        copy_half<<<blocks, 256, 0, stream_a>>>(d_normed_prefetch, d_hidden, H);
-
-        /* Load next layer's post-attn norm weight */
-        snprintf(nm, sizeof(nm), "blk.%d.post_attention_norm.weight", layer_idx + 1);
-        float *d_pan_next = (float *)load_vram(L, g, nm);
-        rmsnorm_inplace<<<1, 256, 0, stream_a>>>(d_normed_prefetch, d_pan_next, H, cfg->rms_eps);
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
-        cudaFree(d_pan_next);
-
-        /* Route for next layer and prefetch on stream_c */
-        route_layer(L, g, layer_idx + 1, d_normed_prefetch,
-                    h_next_expert_indices, h_next_expert_weights);
-        loader_request_on_stream(L, layer_idx + 1, h_next_expert_indices,
-                                 cfg->top_k, L->stream_c);
+    /* ================================================================
+     * BUFFER SWAP: Current becomes previous, next becomes current for
+     * next layer's expert computation
+     * ================================================================ */
+    if (bread_get_ssd_streaming_mode() && layer_idx + 1 < cfg->num_layers) {
+        int *tmp_idx = h_expert_indices_current;
+        float *tmp_wt = h_expert_weights_current;
+        h_expert_indices_current = h_expert_indices_next;
+        h_expert_weights_current = h_expert_weights_next;
+        h_expert_indices_next = tmp_idx;
+        h_expert_weights_next = tmp_wt;
     }
 
     /* d_hidden now contains the full transformer block output */
