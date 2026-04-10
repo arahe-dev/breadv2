@@ -5,9 +5,12 @@ BREAD is a high-performance custom inference engine for large Mixture-of-Experts
 ## Status
 
 **Correctness:** ✅ Verified — outputs correct answers ("Paris", "2+2=4", coherent multi-turn)
-**Performance:** 6.2 tok/s (current) → targeting 12–20 tok/s via optimization phases
-**Profiling:** ✅ Bottleneck identified via NSight Systems (memory, not compute)
-**Architecture:** Custom C/CUDA engine with novel expert scheduling and memory-tier orchestration
+**Performance:** 
+- Default (pre-cached): 6.11 tok/s on 10 tokens, 5.68 tok/s on 50 tokens
+- SSD streaming: 4.42 tok/s on 10 tokens, 4.02 tok/s on 50 tokens (saves 1GB VRAM)
+- Target: 12–20 tok/s via Path B (expert compression) + Path C orchestration
+**Profiling:** ✅ Bottleneck identified via NSight Systems (expert weight loading, not compute)
+**Architecture:** Custom C/CUDA engine with novel pipelined expert loading and memory-tier orchestration
 
 ## Quick Start
 
@@ -28,7 +31,7 @@ nvcc -O2 -x cu main.cu one_layer.cu kernels.cu loader.c gguf.c tokenizer.c bread
 ### Run
 
 ```powershell
-# Standard inference
+# Standard inference (pre-cached experts, fastest)
 .\bread.exe --prompt "<|im_start|>user
 What is the capital of France?<|im_end|>
 <|im_start|>assistant
@@ -37,6 +40,10 @@ What is the capital of France?<|im_end|>
 </think>
 
 " --tokens 50
+
+# SSD streaming mode (on-demand expert loading with pipelined prefetch)
+# Trades 38% throughput for 1GB VRAM savings
+.\bread.exe --ssd-streaming --prompt "..." --tokens 50
 
 # Minimal mode (correctness baseline, slower)
 .\bread.exe --minimal --prompt "..." --tokens 50
@@ -91,34 +98,36 @@ What is the capital of France?<|im_end|>
 | Phase 5 | Full weight caching | ✅ Complete | +12% (6.62 tok/s on 5 tokens) |
 | Phase 6 | FMA kernel reformulation | ⏳ Pending build | +10-12% expected |
 | Phase 7 | AGENCY tool-calling | ✅ Complete | Hermes format support |
-| Phase 8 | FloE expert compression | 📋 Research phase | +2-4 tok/s target |
+| **Path C** | **SSD streaming + pipelined expert loading** | **✅ Complete** | **Infrastructure for on-demand loading** |
+| Phase 8 | FloE expert compression | 📋 Research phase | +60-140% target |
 
-### Optimization Roadmap (Post-Profiling)
+### Optimization Roadmap
 
-Based on profiling findings, three paths are available to reduce memory bandwidth bottleneck:
+Based on profiling findings, multiple paths are available to reduce memory bandwidth bottleneck:
 
-**Path A: Safe + Moderate Gains (Recommended First)**
-- Overlap DMA with GPU computation using dual streams
-- Reduce synchronization overhead (5,786 cudaStreamSynchronize calls)
-- Time: 3-4 hours | Gain: 30-40% (→ 8.5 tok/s)
-- Confidence: High | Risk: Low
+**Path C: SSD Streaming Infrastructure** ✅ **COMPLETE**
+- ✅ Pipelined expert loading: route layer N at end, use at start of layer N+1
+- ✅ Dual-stream orchestration: expert DMA on stream_c while GPU computes on stream_a
+- ✅ On-demand expert loading with LRU cache (18 slots)
+- Results: 4.42 tok/s (10 tokens), 4.02 tok/s (50 tokens) — saves 1GB VRAM vs baseline
+- Trade-off: 38% throughput reduction due to 93% expert LRU cache miss rate
+- Pipelined prefetch validated: 50 cache hits on 50-token sequence (layer N+1 loading while layer N computes)
 
-**Path B: Aggressive + High Gains**
-- Implement expert compression (FloE pattern: lossy quantization)
-- Compress 20GB experts → 2-3GB, cache full set in VRAM
-- Time: 8-10 hours | Gain: 60-140% (→ 12-15 tok/s)
-- Confidence: Medium | Risk: High (numeric precision)
+**Path A: DMA Overlap + Sync Optimization** (Deprecated — Path C supersedes)
+- Dual stream infrastructure already in place
+- Sync optimizations already applied in Phase 4
+- Superseded by Path C's more comprehensive approach
 
-**Path C: Proven + Robust**
-- Implement SSD streaming infrastructure (already designed in codebase)
-- Async expert loading while computing previous layers
-- Can be combined with Path B for hybrid approach
-- Time: 6-8 hours | Gain: 30-60% (→ 8-10 tok/s sustained)
-- Confidence: Med-High | Risk: Medium (complex orchestration)
+**Path B: Expert Compression** 🚀 **NEXT TARGET**
+- Implement FloE-style lossy quantization for expert weights
+- Compress 20GB → 2-3GB, cache full set in VRAM (no LRU cache misses)
+- Expected gain: 60-140% (→ 12-15 tok/s sustained)
+- Can be combined with Path C: stream compressed experts instead of raw weights
+- Time: 8-10 hours | Confidence: Medium | Risk: High (numeric precision)
 
-**Recommended Strategy:** Implement Path C first (uses existing infrastructure), then add Path B (expert compression) on top for 2.5-3x total speedup.
+**Recommended Next Step:** Implement Path B (expert compression) to eliminate 93% cache miss rate and achieve 12+ tok/s target.
 
-See [PROFILING_ANALYSIS.md](PROFILING_ANALYSIS.md) for detailed technical analysis and [PAPER_ANALYSIS_REPORT.md](PAPER_ANALYSIS_REPORT.md) for research on next-generation optimizations.
+See [PROFILING_ANALYSIS.md](PROFILING_ANALYSIS.md), [PROFILING_FINDINGS_SUMMARY.md](PROFILING_FINDINGS_SUMMARY.md), and [PAPER_ANALYSIS_REPORT.md](PAPER_ANALYSIS_REPORT.md) for detailed technical analysis.
 
 ## Implementation Highlights
 
@@ -130,7 +139,9 @@ See [PROFILING_ANALYSIS.md](PROFILING_ANALYSIS.md) for detailed technical analys
 ✅ MoE routing + expert selection (K=8 experts per token)
 ✅ Quantized kernels (Q4_K, Q6_K) for both GPU and CPU paths
 ✅ Host-side KV cache for full-attention layers
-✅ Expert weight caching in VRAM (18 LRU slots → all 256 experts pre-loaded)
+✅ Expert weight caching in VRAM (Phase 5: all 256 experts pre-loaded, 6.11 tok/s)
+✅ SSD streaming mode (Path C: on-demand expert loading with pipelined prefetch, 4.42 tok/s, saves 1GB VRAM)
+✅ Dual-stream CUDA orchestration (stream_a for compute, stream_b/stream_c for expert DMA)
 ✅ Metadata-driven runtime config (parsed from GGUF headers)
 ✅ AGENCY tool-calling agent with Hermes format
 
