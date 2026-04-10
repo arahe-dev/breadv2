@@ -32,6 +32,9 @@
 #include "loader.h"
 #include "tokenizer.h"
 #include "bread_utils.h"
+#include "buffer_pool.h"
+#include "hooks.h"
+#include "progress_tracking.h"
 
 /* ------------------------------------------------------------------ */
 /* Timing (Windows high-resolution)                                     */
@@ -308,13 +311,13 @@ static void compute_logits(const bread_model_config_t *cfg,
                 output_w_type);
         exit(1);
     }
-    /* Sync all streams (bread_matvec uses null stream; f16_matvec uses stream_a) */
-    CUDA_CHECK(cudaDeviceSynchronize());
+    /* Stream-scoped sync instead of global device sync (bread_matvec uses stream_a) */
+    CUDA_CHECK(cudaStreamSynchronize(stream_a));
 }
 
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 /* greedy_sample: copy d_logits to host, return argmax token id       */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 static int32_t greedy_sample(const half *d_logits, half *h_logits)
 {
     const bread_model_config_t *cfg = bread_model_config_get();
@@ -400,7 +403,7 @@ int main(int argc, char **argv)
 
     /* Initialize progress tracking with default callback */
     if (!no_progress) {
-        bread_init_progress();
+        bread_progress_init_default();
     }
 
     /* Enable built-in hooks if requested */

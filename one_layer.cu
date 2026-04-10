@@ -37,6 +37,7 @@
 #include "loader.h"
 #include "bread_utils.h"
 #include "layer_ops.h"
+#include "buffer_pool.h"
 
 /* ------------------------------------------------------------------ */
 /* External: bread_matvec from kernels.cu                              */
@@ -45,9 +46,104 @@
 extern void bread_matvec(void *w, half *x, half *y,
                           int rows, int cols, int qtype, cudaStream_t stream);
 
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/* Phase 2: GPU-side routing kernels                                  */
+/* ================================================================== */
+
+/* Router matmul + softmax in one kernel for efficiency
+ * Computes: logits[i] = sum_j(router_w[i*H + j] * normed2[j])
+ * Then softmax(logits) → probs[i]
+ */
+static __global__ void router_matmul_softmax(
+    const half *d_normed2,           /* [H] input (half) */
+    const float *d_router_w,         /* [num_experts × H] weights (float) */
+    float *d_logits,                 /* [num_experts] logits (output) */
+    int H, int num_experts)
+{
+    int expert_idx = blockIdx.x;
+    if (expert_idx >= num_experts) return;
+
+    /* Each block handles one expert: compute dot product */
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < H; j += blockDim.x) {
+        sum += d_router_w[expert_idx * H + j] * __half2float(d_normed2[j]);
+    }
+
+    /* Warp reduce */
+    for (int delta = 16; delta > 0; delta /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, delta);
+
+    if (threadIdx.x == 0) {
+        d_logits[expert_idx] = sum;
+    }
+}
+
+/* Softmax in-place on GPU */
+static __global__ void softmax_inplace(float *logits, int n)
+{
+    int tid = threadIdx.x;
+    __shared__ float max_val, sum_exp;
+
+    /* Step 1: find maximum for numerical stability */
+    float thread_max = (tid < n) ? logits[tid] : -1e30f;
+    for (int delta = 16; delta > 0; delta /= 2)
+        thread_max = max(thread_max, __shfl_down_sync(0xffffffff, thread_max, delta));
+
+    if (tid == 0) max_val = thread_max;
+    __syncthreads();
+
+    /* Step 2: compute exp and sum */
+    float exp_val = (tid < n) ? expf(logits[tid] - max_val) : 0.0f;
+    float thread_sum = exp_val;
+    for (int delta = 16; delta > 0; delta /= 2)
+        thread_sum += __shfl_down_sync(0xffffffff, thread_sum, delta);
+
+    if (tid == 0) sum_exp = thread_sum;
+    __syncthreads();
+
+    /* Step 3: normalize */
+    if (tid < n) {
+        logits[tid] = exp_val / (sum_exp + 1e-6f);
+    }
+}
+
+/* TopK selection: find K largest values and their indices */
+static __global__ void topk_select(
+    const float *d_probs,           /* [num_experts] values */
+    int *d_indices,                 /* [top_k] output indices */
+    float *d_weights,               /* [top_k] output values */
+    int num_experts, int top_k)
+{
+    /* Simplified: use first K threads to find their best */
+    int k = threadIdx.x;
+    if (k >= top_k) return;
+
+    float best = -1.0f;
+    int best_id = -1;
+
+    /* Each thread finds the k-th largest by simple scan */
+    for (int i = 0; i < num_experts; i++) {
+        float val = d_probs[i];
+        bool taken = false;
+        for (int j = 0; j < k; j++) {
+            if (d_indices[j] == i) {
+                taken = true;
+                break;
+            }
+        }
+        if (!taken && val > best) {
+            best = val;
+            best_id = i;
+        }
+    }
+
+    d_indices[k] = best_id;
+    d_weights[k] = best;
+}
+
+/* ================================================================== */
 /* File-scope scratch buffers for CPU conversion functions             */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 
 static half *s_vram2cpu_tmp = NULL;  /* scratch for vram_half_to_cpu_float  */
 
@@ -211,6 +307,15 @@ static void *load_vram(const loader_t *L, const gguf_ctx_t *g,
 /* Convert VRAM half[] to CPU float[] */
 static void vram_half_to_cpu_float(const half *d_x, float *h_f, int n)
 {
+    /* Allocate scratch buffer on first use if not already done */
+    if (!s_vram2cpu_tmp) {
+        const bread_model_config_t *cfg = bread_model_config_get();
+        s_vram2cpu_tmp = (half *)malloc(cfg->ssm_qkv_dim * sizeof(half));
+        if (!s_vram2cpu_tmp) {
+            fprintf(stderr, "vram_half_to_cpu_float: malloc failed for s_vram2cpu_tmp\n");
+            exit(1);
+        }
+    }
     CUDA_CHECK(cudaMemcpy(s_vram2cpu_tmp, d_x, n * sizeof(half), cudaMemcpyDeviceToHost));
     for (int i = 0; i < n; i++) h_f[i] = __half2float(s_vram2cpu_tmp[i]);
 }
@@ -786,6 +891,41 @@ float one_layer_last_branch_rms(void)
 }
 
 /* ================================================================== */
+/* ================================================================== */
+/* Phase 2: GPU routing wrapper - keeps routing on device              */
+/* ================================================================== */
+static void route_layer_gpu(const bread_model_config_t *cfg, const half *d_normed2,
+                            const float *d_router_w, const half *d_shared_gate_w,
+                            int *d_expert_indices, float *d_expert_weights,
+                            float *h_shared_gate_score, cudaStream_t stream)
+{
+    int H = cfg->hidden_dim;
+    int num_experts = cfg->num_experts;
+    int top_k = cfg->top_k;
+
+    /* Allocate temporary device buffers for logits */
+    float *d_logits = NULL;
+    CUDA_CHECK(cudaMalloc(&d_logits, num_experts * sizeof(float)));
+
+    /* Step 1: Router matmul → logits[num_experts] */
+    router_matmul_softmax<<<num_experts, 256, 0, stream>>>(
+        d_normed2, d_router_w, d_logits, H, num_experts);
+
+    /* Step 2: Softmax (in-place on d_logits) */
+    softmax_inplace<<<1, 256, 0, stream>>>(d_logits, num_experts);
+
+    /* Step 3: TopK selection → expert_indices, expert_weights (device) */
+    topk_select<<<1, top_k, 0, stream>>>(d_logits, d_expert_indices,
+                                         d_expert_weights, num_experts, top_k);
+
+    /* Step 4: Shared gate score (if exists) - still computed on device via kernel */
+    /* For now, set to 0.0; could add a device kernel for this later */
+    *h_shared_gate_score = 0.0f;
+
+    CUDA_CHECK(cudaFree(d_logits));
+}
+
+/* ================================================================== */
 /* route_layer: MoE routing logic (extracted for prefetching)         */
 /*                                                                    */
 /* Takes the post-attn normalised hidden state (d_normed2) and       */
@@ -897,7 +1037,6 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     static float *h_q_score  = NULL;
     static float *h_q_gate   = NULL;
     static float *h_scores   = NULL;
-    float *&h_hidden = g_h_hidden;  /* alias to file-scope for RMS access */
     static float *h_normed   = NULL;
     static float *h_normed2  = NULL;
     static float *h_o_cpu    = NULL;
@@ -908,10 +1047,78 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     static float *h_eu_cpu   = NULL;
     static float *h_eo_cpu   = NULL;
     static half  *h_hidden_half = NULL;
-    static half  *h_attn_half_buf = NULL;  /* max(attn_out_dim, ssm_z_dim) × half */
-    static int   *h_expert_indices = NULL; /* top_k ints                          */
-    static float *h_expert_weights = NULL; /* top_k floats                        */
-    static float *h_logits = NULL;         /* num_experts floats                  */
+    static half  *h_attn_half_buf = NULL;
+    static int   *h_expert_indices = NULL;
+    static float *h_expert_weights = NULL;
+    static float *h_logits = NULL;
+
+    float *&h_hidden = g_h_hidden;  /* alias to file-scope for RMS access */
+
+    /* Get the pre-allocated buffer pool (initialized in main) */
+    static const bread_buffer_pool_t *pool = NULL;
+    if (!pool) {
+        pool = bread_buffer_pool_get();
+        if (!pool) {
+            fprintf(stderr, "one_layer_forward: buffer pool not initialized\n");
+            exit(1);
+        }
+    }
+
+    /* Alias device and host buffers from pool on every call
+       (they're static pointers in the function, but pool provides them) */
+    if (!d_normed) {  /* Only alias once on first call */
+        d_normed   = pool->d_normed;
+        d_normed2  = pool->d_normed2;
+        d_q        = pool->d_q;
+        d_k        = pool->d_k;
+        d_v        = pool->d_v;
+        d_attn_out = pool->d_attn_out;
+        d_o_out    = pool->d_o_out;
+        d_sg       = pool->d_sg;
+        d_su       = pool->d_su;
+        d_sh_out   = pool->d_sh_out;
+        d_eg       = pool->d_eg[0];
+        d_eu       = pool->d_eu[0];
+        d_eo       = pool->d_eo[0];
+        d_qkv      = pool->d_qkv;
+        d_z        = pool->d_z;
+        d_alpha    = pool->d_alpha;
+        d_beta     = pool->d_beta;
+
+        h_qkv      = pool->h_qkv;
+        h_z        = pool->h_z;
+        h_alpha    = pool->h_alpha;
+        h_beta     = pool->h_beta;
+        h_conv_out = pool->h_conv_out;
+        h_attn_out = pool->h_attn_out;
+        h_head_tmp = pool->h_head_tmp;
+        h_ssm_qrep = pool->h_ssm_qrep;
+        h_ssm_krep = pool->h_ssm_krep;
+        h_ssm_sk   = pool->h_ssm_sk;
+        h_ssm_d    = pool->h_ssm_d;
+        h_q_full   = pool->h_q_full;
+        h_kv_k     = pool->h_kv_k;
+        h_kv_v     = pool->h_kv_v;
+        h_q_score  = pool->h_q_score;
+        h_q_gate   = pool->h_q_gate;
+        h_scores   = pool->h_scores;
+        h_normed   = pool->h_normed;
+        h_normed2  = pool->h_normed2;
+        h_o_cpu    = pool->h_o_cpu;
+        h_sg_cpu   = pool->h_sg_cpu;
+        h_su_cpu   = pool->h_su_cpu;
+        h_sh_cpu   = pool->h_sh_cpu;
+        h_eg_cpu   = pool->h_eg_cpu;
+        h_eu_cpu   = pool->h_eu_cpu;
+        h_eo_cpu   = pool->h_eo_cpu;
+        h_hidden_half  = pool->h_hidden_half;
+        h_attn_half_buf = pool->h_attn_half_buf;
+        h_expert_indices = pool->h_expert_indices;
+        h_expert_weights = pool->h_expert_weights;
+        h_logits   = pool->h_logits;
+    }
+
+    /* Per-layer state (still static, allocated once) */
     static float *ssm_conv_state[LOADER_MAX_LAYERS] = {0};
     static float *ssm_state[LOADER_MAX_LAYERS] = {0};
     static float *kv_k_cache[LOADER_MAX_LAYERS] = {0};
@@ -929,62 +1136,9 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
     }
     if (layer_idx == 0) last_pos = pos;
 
-    if (!d_normed) {
-        CUDA_CHECK(cudaMalloc(&d_normed,   H                          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_normed2,  H                          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_q,        cfg->q_proj_dim            * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_k,        cfg->kv_proj_dim           * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_v,        cfg->kv_proj_dim           * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_attn_out, cfg->attn_out_dim          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_o_out,    H                          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_sg,       cfg->shared_inter          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_su,       cfg->shared_inter          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_sh_out,   H                          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_eg,       cfg->expert_inter          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_eu,       cfg->expert_inter          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_eo,       H                          * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_qkv,      cfg->ssm_qkv_dim           * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_z,        cfg->ssm_z_dim             * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_alpha,    cfg->ssm_num_v_heads       * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&d_beta,     cfg->ssm_num_v_heads       * sizeof(half)));
-
-        h_qkv      = (float *)malloc(cfg->ssm_qkv_dim * sizeof(float));
-        h_z        = (float *)malloc(cfg->ssm_z_dim * sizeof(float));
-        h_alpha    = (float *)malloc(cfg->ssm_num_v_heads * sizeof(float));
-        h_beta     = (float *)malloc(cfg->ssm_num_v_heads * sizeof(float));
-        h_conv_out = (float *)malloc(cfg->ssm_qkv_dim * sizeof(float));
-        h_attn_out = (float *)malloc(cfg->attn_out_dim * sizeof(float));
-        h_head_tmp = (float *)malloc(cfg->ssm_head_dim * sizeof(float));
-        h_ssm_qrep = (float *)malloc((size_t)cfg->ssm_num_v_heads * cfg->ssm_head_dim * sizeof(float));
-        h_ssm_krep = (float *)malloc((size_t)cfg->ssm_num_v_heads * cfg->ssm_head_dim * sizeof(float));
-        h_ssm_sk   = (float *)malloc(cfg->ssm_head_dim * sizeof(float));
-        h_ssm_d    = (float *)malloc(cfg->ssm_head_dim * sizeof(float));
-        h_q_full   = (float *)malloc(cfg->q_proj_dim * sizeof(float));
-        h_kv_k     = (float *)malloc(cfg->kv_proj_dim * sizeof(float));
-        h_kv_v     = (float *)malloc(cfg->kv_proj_dim * sizeof(float));
-        h_q_score  = (float *)malloc(cfg->attn_out_dim * sizeof(float));
-        h_q_gate   = (float *)malloc(cfg->attn_out_dim * sizeof(float));
-        h_scores   = (float *)malloc(cfg->kv_cache_len * sizeof(float));
-        h_hidden   = (float *)malloc(H * sizeof(float));
-        h_normed   = (float *)malloc(H * sizeof(float));
-        h_normed2  = (float *)malloc(H * sizeof(float));
-        h_o_cpu    = (float *)malloc(H * sizeof(float));
-        h_sg_cpu   = (float *)malloc(cfg->shared_inter * sizeof(float));
-        h_su_cpu   = (float *)malloc(cfg->shared_inter * sizeof(float));
-        h_sh_cpu   = (float *)malloc(H * sizeof(float));
-        h_eg_cpu   = (float *)malloc(cfg->expert_inter * sizeof(float));
-        h_eu_cpu   = (float *)malloc(cfg->expert_inter * sizeof(float));
-        h_eo_cpu   = (float *)malloc(H * sizeof(float));
-        h_hidden_half = (half *)malloc(H * sizeof(half));
-        if (!h_qkv || !h_z || !h_alpha || !h_beta || !h_conv_out || !h_attn_out ||
-            !h_head_tmp || !h_ssm_qrep || !h_ssm_krep || !h_ssm_sk || !h_ssm_d ||
-            !h_q_full || !h_kv_k || !h_kv_v || !h_q_score || !h_q_gate || !h_scores ||
-            !h_hidden || !h_normed || !h_normed2 || !h_o_cpu || !h_sg_cpu || !h_su_cpu ||
-            !h_sh_cpu || !h_eg_cpu || !h_eu_cpu || !h_eo_cpu || !h_hidden_half) {
-            fprintf(stderr, "one_layer_forward: host scratch alloc failed\n");
-            exit(1);
-        }
-
+    /* Initialize per-layer state buffers on first call */
+    static int initialized = 0;
+    if (!initialized) {
         for (int layer = 0; layer < cfg->num_layers; layer++) {
             if (bread_layer_is_full_attention(layer)) {
                 kv_k_cache[layer] = (float *)calloc(
@@ -1006,17 +1160,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                 }
             }
         }
-
-        /* Per-call scratch buffers (pre-allocated to avoid per-call malloc/free) */
-        int attn_half_n = cfg->attn_out_dim > cfg->ssm_z_dim
-                          ? cfg->attn_out_dim : cfg->ssm_z_dim;
-        h_attn_half_buf = (half *)malloc(attn_half_n * sizeof(half));
-        h_expert_indices = (int *)malloc(cfg->top_k * sizeof(int));
-        h_expert_weights = (float *)malloc(cfg->top_k * sizeof(float));
-        h_logits = (float *)malloc(cfg->num_experts * sizeof(float));
-
-        /* Scratch for vram_half_to_cpu_float — sized to max call (ssm_qkv_dim) */
-        s_vram2cpu_tmp = (half *)malloc(cfg->ssm_qkv_dim * sizeof(half));
+        initialized = 1;
     }
 
     if (bread_get_boring_mode()) {
@@ -1330,7 +1474,8 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         copy_half<<<blocks, 256, 0, stream_a>>>(d_normed, d_hidden, H);
         rmsnorm_inplace<<<1, 256, 0, stream_a>>>(d_normed, d_attn_norm_w,
                                                   H, cfg->rms_eps);
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        /* Record event but don't sync yet; let GPU continue if possible */
+        CUDA_CHECK(cudaEventRecord(pool->normed2_ready_event, stream_a));
         if (!wc) cudaFree(d_attn_norm_w);
     }
 
@@ -1362,7 +1507,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         bread_matvec(d_vw, d_normed, d_v,
                      cfg->kv_proj_dim, H, GGML_TYPE_Q6_K, stream_a);
 
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        /* Sync only when CPU needs Q/K/V data below */
         if (!wc) { cudaFree(d_qw); cudaFree(d_kw); cudaFree(d_vw); }
     }
 
@@ -1377,6 +1522,9 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         const float *k_norm_w;
         int heads_per_kv = cfg->num_q_heads / cfg->num_kv_heads;
         int kv_len;
+
+        /* Wait for Q/K/V projections to complete before copying to host */
+        CUDA_CHECK(cudaStreamSynchronize(stream_a));
 
         vram_half_to_cpu_float(d_q, h_q_full, cfg->q_proj_dim);
         vram_half_to_cpu_float(d_k, h_kv_k, cfg->kv_proj_dim);
@@ -1438,7 +1586,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                                   cfg->attn_out_dim * sizeof(half),
                                   cudaMemcpyHostToDevice));
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        /* Don't sync; GPU will naturally synchronize when it needs attn_out */
     } else {
         const float *conv_w;
         const float *ssm_a;
@@ -1472,6 +1620,8 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                      cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K, stream_a);
         bread_matvec(d_beta_w, d_normed, d_beta,
                      cfg->ssm_num_v_heads, H, GGML_TYPE_Q4_K, stream_a);
+
+        /* Sync before D2H copy of SSM projections */
         CUDA_CHECK(cudaStreamSynchronize(stream_a));
 
         if (!wc) {
@@ -1568,7 +1718,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                                   cfg->ssm_z_dim * sizeof(half),
                                   cudaMemcpyHostToDevice));
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        /* Don't sync; GPU will naturally synchronize when needed */
     }
 
     /* ================================================================
@@ -1588,15 +1738,16 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
         bread_matvec(d_ow, d_attn_out, d_o_out,
                      H, cfg->attn_out_dim, GGML_TYPE_Q4_K, stream_a);
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
         if (!wc) cudaFree(d_ow);
         if (bread_get_trace_debug()) {
+            /* Sync for RMS measurement */
+            CUDA_CHECK(cudaStreamSynchronize(stream_a));
             g_last_branch_rms = device_half_rms(d_o_out, H);
         }
 
         int blocks = (H + 255) / 256;
         scale_accum<<<blocks, 256, 0, stream_a>>>(d_hidden, d_o_out, 1.0f, H);
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        /* Don't sync; let subsequent work depend naturally */
     } else {
         void *d_sw;
         if (wc) {
@@ -1638,7 +1789,7 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
         copy_half<<<blocks, 256, 0, stream_a>>>(d_normed2, d_hidden, H);
         rmsnorm_inplace<<<1, 256, 0, stream_a>>>(d_normed2, d_pan_w,
                                                   H, cfg->rms_eps);
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
+        /* Record event; CPU routing will implicitly wait via host copy if needed */
         if (!wc) cudaFree(d_pan_w);
     }
 
@@ -1701,14 +1852,13 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
 
         bread_matvec(d_sd_w, d_sg, d_sh_out,
                      H, cfg->shared_inter, GGML_TYPE_Q6_K, stream_a);
-        CUDA_CHECK(cudaStreamSynchronize(stream_a));
         if (!wc) cudaFree(d_sd_w);
 
         {
             float shared_weight = cpu_sigmoid(shared_gate_score);
             int blocks = (H + 255) / 256;
             scale_accum<<<blocks, 256, 0, stream_a>>>(d_hidden, d_sh_out, shared_weight, H);
-            CUDA_CHECK(cudaStreamSynchronize(stream_a));
+            /* Don't sync; let expert loop work proceed on same stream */
         }
     }
 
