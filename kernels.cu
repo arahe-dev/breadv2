@@ -155,6 +155,7 @@ __global__ void dequant_q4k_matvec(
 {
     __shared__ float sx[BLOCK_ELEMS];
     __shared__ float warp_buf[8];           /* one slot per warp (8 warps) */
+    __shared__ uint8_t scales_sh[12];       /* Phase A: shared memory for scales */
 
     int row    = (int)blockIdx.x;
     if (row >= rows) return;
@@ -171,10 +172,43 @@ __global__ void dequant_q4k_matvec(
         sx[tid] = __half2float(x[b * BLOCK_ELEMS + tid]);
         __syncthreads();
 
-        /* Each thread dequantises its element and accumulates */
         const uint8_t *blk =
             w + ((size_t)row * nblocks + b) * Q4K_BLOCK_BYTES;
-        sum += dequant_q4k_elem(blk, tid) * sx[tid];
+
+        /* Phase A Opt: Load scales into shared memory (12 bytes, cooperatively) */
+        if (tid < 12) {
+            scales_sh[tid] = blk[4 + tid];
+        }
+        __syncthreads();
+
+        /* Phase A Opt: Inline dequant with shared memory scales */
+        uint16_t d_raw    = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        uint16_t dmin_raw = (uint16_t)blk[2] | ((uint16_t)blk[3] << 8);
+        float d    = __half2float(__ushort_as_half(d_raw));
+        float dmin = __half2float(__ushort_as_half(dmin_raw));
+
+        const uint8_t *qs = blk + 16;
+
+        int group = tid / 64;
+        int sub   = (tid % 64) / 32;
+        int pos   = tid % 32;
+        int is    = group * 2 + sub;
+
+        /* Extract scales from shared memory (phase A opt) */
+        uint8_t sc, m;
+        if (is < 4) {
+            sc = scales_sh[is]     & 63;
+            m  = scales_sh[is + 4] & 63;
+        } else {
+            sc = (scales_sh[is + 4] & 0x0F) | ((scales_sh[is - 4] >> 6) << 4);
+            m  = (scales_sh[is + 4] >>   4) | ((scales_sh[is    ] >> 6) << 4);
+        }
+
+        uint8_t qs_byte = qs[group * 32 + pos];
+        int nibble = (sub == 0) ? (qs_byte & 0xF) : (qs_byte >> 4);
+
+        sum += d * (float)sc * (float)nibble * sx[tid]
+             - dmin * (float)m * sx[tid];
 
         __syncthreads();
     }
@@ -203,6 +237,9 @@ __global__ void dequant_q6k_matvec(
 {
     __shared__ float sx[BLOCK_ELEMS];
     __shared__ float warp_buf[8];
+    __shared__ uint8_t ql_sh[128];          /* Phase A: shared memory for ql */
+    __shared__ uint8_t qh_sh[64];           /* Phase A: shared memory for qh */
+    __shared__ int8_t  sc_sh[16];           /* Phase A: shared memory for scales */
 
     int row    = (int)blockIdx.x;
     if (row >= rows) return;
@@ -220,7 +257,40 @@ __global__ void dequant_q6k_matvec(
 
         const uint8_t *blk =
             w + ((size_t)row * nblocks + b) * Q6K_BLOCK_BYTES;
-        sum += dequant_q6k_elem(blk, tid) * sx[tid];
+
+        /* Phase A Opt: Load Q6_K block data into shared memory */
+        if (tid < 128) ql_sh[tid] = blk[tid];
+        if (tid < 64)  qh_sh[tid] = blk[128 + tid];
+        if (tid < 16)  sc_sh[tid] = *((const int8_t *)(blk + 192 + tid));
+        __syncthreads();
+
+        /* Phase A Opt: Inline dequant using shared memory */
+        uint16_t d_raw = (uint16_t)blk[208] | ((uint16_t)blk[209] << 8);
+        float d = __half2float(__ushort_as_half(d_raw));
+
+        int pass   = tid / 128;
+        int e_in   = tid % 128;
+        int sub    = e_in / 32;   /* 0..3 */
+        int l      = e_in % 32;
+        int is     = l / 16;      /* 0 or 1 within pass */
+
+        int ql_base = pass * 64;
+        int qh_base = pass * 32;
+        int sc_base = pass * 8;
+
+        int ql_idx, qh_shift, use_high_nibble;
+        if      (sub == 0) { ql_idx = ql_base + l;      qh_shift = 0; use_high_nibble = 0; }
+        else if (sub == 1) { ql_idx = ql_base + l + 32; qh_shift = 2; use_high_nibble = 0; }
+        else if (sub == 2) { ql_idx = ql_base + l;      qh_shift = 4; use_high_nibble = 1; }
+        else               { ql_idx = ql_base + l + 32; qh_shift = 6; use_high_nibble = 1; }
+
+        int nibble  = use_high_nibble ? (ql_sh[ql_idx] >> 4) : (ql_sh[ql_idx] & 0xF);
+        int qh_bits = (qh_sh[qh_base + l] >> qh_shift) & 3;
+        int8_t q    = (int8_t)(nibble | (qh_bits << 4)) - 32;
+
+        int sc_idx = sc_base + is + sub * 2;
+
+        sum += d * (float)sc_sh[sc_idx] * (float)q * sx[tid];
 
         __syncthreads();
     }

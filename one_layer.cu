@@ -1977,18 +1977,32 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
             } else {
                 const loader_layer_info_t *li = &L->layers[layer_idx];
 
+                /* Allocate buffers for GPU->CPU transfer (allocated once) */
+                static half *h_normed_fp16 = NULL;
+                static float *h_normed_fp32 = NULL;
+                if (!h_normed_fp16) {
+                    h_normed_fp16 = (half*)malloc(H * sizeof(half));
+                    h_normed_fp32 = (float*)malloc(H * sizeof(float));
+                }
+
                 /* ASYNC PHASE 1: Fire async H2D transfer on stream_b
-                   h_normed2 is pinned memory, so async transfer is efficient.
-                   Explicit sync ensures h_normed2 is ready before CPU experts access it. */
-                CUDA_CHECK(cudaMemcpyAsync(h_normed2, d_normed2, H * sizeof(half),
+                   Copy d_normed2 (fp16) from GPU to pinned host buffer.
+                   Explicit sync ensures data is ready before CPU experts access it. */
+                CUDA_CHECK(cudaStreamSynchronize(stream_a));  /* Ensure d_normed2 is ready */
+                CUDA_CHECK(cudaMemcpyAsync(h_normed_fp16, d_normed2, H * sizeof(half),
                                            cudaMemcpyDeviceToHost, stream_b));
                 CUDA_CHECK(cudaStreamSynchronize(stream_b));
+
+                /* Convert fp16 to fp32 for CPU expert computation */
+                for (int i = 0; i < H; i++) {
+                    h_normed_fp32[i] = __half2float(h_normed_fp16[i]);
+                }
 
                 memset(h_cpu_expert_delta, 0, H * sizeof(float));
 
                 /* ASYNC PHASE 2: Launch CPU expert computation in parallel (8 OpenMP threads).
-                   h_normed2 is guaranteed to be ready from H2D sync above.
-                   This 5.2ms computation overlaps with GPU attention (3ms) and shared expert (1.5ms). */
+                   h_normed_fp32 is guaranteed to be ready from conversion above.
+                   This computation overlaps with GPU attention and shared expert work. */
 #pragma omp parallel for schedule(static, 1) num_threads(8)
                 for (int k = 0; k < cfg->top_k; k++) {
                     const int expert_idx = active_expert_indices[k];
@@ -1998,11 +2012,12 @@ void one_layer_forward(half *d_hidden, int layer_idx, int pos,
                     const uint8_t *gate_src = li->gate_base + (uint64_t)expert_idx * li->gate_expert_bytes;
                     const uint8_t *up_src = li->up_base + (uint64_t)expert_idx * li->up_expert_bytes;
                     const uint8_t *down_src = li->down_base + (uint64_t)expert_idx * li->down_expert_bytes;
-                    /* h_normed2 is ready via implicit OpenMP barrier sync with async H2D transfer */
-                    cpu_tensor_matvec(gate_src, li->gate_type, h_normed2, tmp_gate, cfg->expert_inter, H);
-                    cpu_tensor_matvec(up_src, li->up_type, h_normed2, tmp_up, cfg->expert_inter, H);
+                    /* h_normed_fp32 is ready via implicit OpenMP barrier */
+                    cpu_tensor_matvec(gate_src, li->gate_type, h_normed_fp32, tmp_gate, cfg->expert_inter, H);
+                    cpu_tensor_matvec(up_src, li->up_type, h_normed_fp32, tmp_up, cfg->expert_inter, H);
                     cpu_swiglu(tmp_gate, tmp_up, tmp_gate, cfg->expert_inter);
                     cpu_tensor_matvec(down_src, li->down_type, tmp_gate, tmp_out, H, cfg->expert_inter);
+                    /* Weight applied AFTER FFN (matches GPU semantics) */
                     for (int i = 0; i < H; i++) tmp_out[i] *= active_expert_weights[k];
                 }
                 /* Implicit barrier here - all threads finish before proceeding */
