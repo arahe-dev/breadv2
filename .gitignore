@@ -1,0 +1,6 @@
+
+# NSight profiler output (may contain API keys)
+profile*.sqlite
+profile*.nsys-rep
+autoresearch_profile.sh
+autoresearch_results/
