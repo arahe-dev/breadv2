@@ -68,6 +68,11 @@ extern int bread_benchmark_expert_block(const bread_model_config_t *cfg,
                                         const loader_t *L,
                                         const weight_cache_t *wc);
 
+/* expert_profile.cu */
+extern int bread_profile_gpu_experts(const bread_model_config_t *cfg,
+                                     const loader_t *L,
+                                     const weight_cache_t *wc);
+
 /* ------------------------------------------------------------------ */
 /* Q4K constants (must match kernels.cu)                               */
 /* ------------------------------------------------------------------ */
@@ -383,6 +388,7 @@ int main(int argc, char **argv)
     int         hooks_debug = 0;
     int         no_progress = 0;
     int         bench_experts = 0;
+    int         profile_gpu_experts = 0;
 
     /* -- Parse args ------------------------------------------------- */
     for (int i = 1; i < argc; i++) {
@@ -401,6 +407,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--hooks-debug")) hooks_debug = 1;
         else if (!strcmp(argv[i], "--no-progress")) no_progress = 1;
         else if (!strcmp(argv[i], "--bench-experts")) bench_experts = 1;
+        else if (!strcmp(argv[i], "--profile-gpu-experts")) profile_gpu_experts = 1;
     }
 
     bread_set_boring_mode(minimal_mode);
@@ -483,6 +490,14 @@ int main(int argc, char **argv)
 
     if (bench_experts) {
         int rc = bread_benchmark_expert_block(cfg, L, wc);
+        bread_buffer_pool_free();
+        weight_cache_free(wc);
+        loader_free(L);
+        return rc;
+    }
+
+    if (profile_gpu_experts) {
+        int rc = bread_profile_gpu_experts(cfg, L, wc);
         bread_buffer_pool_free();
         weight_cache_free(wc);
         loader_free(L);
