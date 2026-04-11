@@ -1,0 +1,12 @@
+C:\bread_v2\agency\target\debug\deps\error_code-314576992544284f.d: C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\lib.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\defs.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\types.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\utils.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\posix.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\system.rs
+
+C:\bread_v2\agency\target\debug\deps\liberror_code-314576992544284f.rlib: C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\lib.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\defs.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\types.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\utils.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\posix.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\system.rs
+
+C:\bread_v2\agency\target\debug\deps\liberror_code-314576992544284f.rmeta: C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\lib.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\defs.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\types.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\utils.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\posix.rs C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\system.rs
+
+C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\lib.rs:
+C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\defs.rs:
+C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\types.rs:
+C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\utils.rs:
+C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\posix.rs:
+C:\Users\arahe\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\error-code-3.3.2\src\system.rs:

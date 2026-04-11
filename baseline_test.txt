@@ -1,0 +1,50 @@
+loader: reading model...   2.2% (1.58 GB/s)loader: reading model...   4.5% (1.56 GB/s)loader: reading model...   6.7% (1.54 GB/s)loader: reading model...   9.0% (1.54 GB/s)loader: reading model...  11.2% (1.54 GB/s)loader: reading model...  13.5% (1.53 GB/s)loader: reading model...  15.7% (1.53 GB/s)loader: reading model...  18.0% (1.53 GB/s)loader: reading model...  20.2% (1.53 GB/s)loader: reading model...  22.5% (1.52 GB/s)loader: reading model...  24.7% (1.52 GB/s)loader: reading model...  27.0% (1.52 GB/s)loader: reading model...  29.2% (1.52 GB/s)loader: reading model...  31.5% (1.52 GB/s)loader: reading model...  33.7% (1.53 GB/s)loader: reading model...  36.0% (1.53 GB/s)loader: reading model...  38.2% (1.53 GB/s)loader: reading model...  40.5% (1.53 GB/s)loader: reading model...  42.7% (1.53 GB/s)loader: reading model...  45.0% (1.53 GB/s)loader: reading model...  47.2% (1.52 GB/s)loader: reading model...  49.5% (1.52 GB/s)loader: reading model...  51.7% (1.52 GB/s)loader: reading model...  54.0% (1.51 GB/s)loader: reading model...  56.2% (1.51 GB/s)loader: reading model...  58.5% (1.51 GB/s)loader: reading model...  60.7% (1.50 GB/s)loader: reading model...  63.0% (1.50 GB/s)loader: reading model...  65.2% (1.47 GB/s)loader: reading model...  67.5% (1.43 GB/s)loader: reading model...  69.7% (1.39 GB/s)loader: reading model...  72.0% (1.33 GB/s)loader: reading model...  74.2% (1.28 GB/s)loader: reading model...  76.5% (1.25 GB/s)loader: reading model...  78.7% (1.21 GB/s)loader: reading model...  81.0% (1.17 GB/s)loader: reading model...  83.2% (1.17 GB/s)loader: reading model...  85.5% (1.17 GB/s)loader: reading model...  87.7% (1.17 GB/s)loader: reading model...  90.0% (1.18 GB/s)loader: reading model...  92.2% (1.18 GB/s)loader: reading model...  94.5% (1.18 GB/s)loader: reading model...  96.7% (1.19 GB/s)loader: reading model...  99.0% (1.19 GB/s)loader: read 23.87 GB in 20.0 s (1.19 GB/s)            
+loader: ready (host RAM, 18 VRAM slots)
+gguf: version=3  tensors=1959  kv_pairs=57
+gguf: alignment=32 bytes
+gguf: header parsed in 0.024 s  —  data section at 0xb83a00
+weight_cache: loading expert weights to VRAM...
+weight_cache: loaded experts, total VRAM: 20689.4 MiB
+tokenizer: vocab=248320 merges=247587 bos=-1 eos=248046 specials=276
+=== BREAD inference ===
+Prompt   : "The future of AI"
+MaxTokens: 20
+
+Mode     : orchestrated
+
+[1/4] Loading model into pinned RAM (~22 GB)...
+      done in 20.2 s
+
+      Initializing weight cache...
+weight_cache: loaded 40 layers, 769.4 MiB VRAM
+      Loading expert weights to VRAM...
+      Initializing layer buffer pool...
+[2/4] Loading tokenizer...
+      vocab size: 248320
+
+[3/4] Uploading output_norm + lm_head to VRAM...
+      output_norm.weight: 8.0 KB (F32)
+      output.weight:      397.9 MB (type Q6_K)
+
+[4/4] Encoding prompt...
+      16 tokens: [248045 846 198 760 3725 314 14791 248046 ...]
+
+--- Prompt prefill (16 tokens) ---
+    prefill: 2129 ms  (133.1 ms/tok)
+
+--- Generated output ---
+The future of AI is a landscape of profound transformation,[PROGRESS] DECODE: token 10/20 5.56 tok/s
+ characterized by a shift from **narrow intelligence[PROGRESS] DECODE: token 19/20 5.54 tok/s
+loader: shutting down — 0 hits, 0 misses
+
+
+=== Benchmark ===
+  Prompt tokens    : 16
+  Generated tokens : 20
+  Prefill          : 2129 ms  (133.1 ms/tok)
+  Time to 1st tok  : 68.5 ms
+  Total decode     : 3498 ms  (5.72 tok/s)
+
+  NOTE: one_layer_forward() allocates/frees VRAM per call —
+  bulk of time is cudaMalloc overhead, not compute.
+  Next step: cache non-expert weights in VRAM at startup.

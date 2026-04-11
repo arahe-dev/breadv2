@@ -1,0 +1,38 @@
+========================================
+BREAD Performance Baseline Benchmark (Fixed)
+========================================
+
+NOTE: Thinking blocks removed from prompt format
+      to avoid premature EOS token generation
+
+[TEST] Running with 50 tokens...
+benchmark_corrected.sh: line 42: bc: command not found
+  ✓ Generation completed
+  Time: s
+  Requested: 50 tokens
+  Output file: bench_corrected_50.log
+
+[TEST] Running with 100 tokens...
+benchmark_corrected.sh: line 42: bc: command not found
+  ✓ Generation completed
+  Time: s
+  Requested: 100 tokens
+  Output file: bench_corrected_100.log
+
+[TEST] Running with 200 tokens...
+benchmark_corrected.sh: line 42: bc: command not found
+  ✓ Generation completed
+  Time: s
+  Requested: 200 tokens
+  Output file: bench_corrected_200.log
+
+========================================
+Benchmark complete!
+Check output files for detailed results:
+  bench_corrected_50.log
+  bench_corrected_100.log
+  bench_corrected_200.log
+
+NOTE: Output includes loader/cache initialization time
+      Each test reloads the 23.87 GB model (~20s)
+========================================

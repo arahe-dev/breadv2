@@ -1,0 +1,188 @@
+<svg viewBox="0 0 1400 1000" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font-size: 20px; font-weight: bold; }
+      .subtitle { font-size: 14px; font-weight: bold; color: #5cb85c; }
+      .block-label { font-size: 14px; font-weight: bold; }
+      .time-label { font-size: 12px; fill: #d9534f; }
+      .throughput { font-size: 18px; font-weight: bold; fill: #5cb85c; }
+      .gain { font-size: 14px; font-weight: bold; color: #5cb85c; }
+      .arrow { stroke: #333; stroke-width: 2.5; fill: none; marker-end: url(#arrowhead); }
+      .overlap-arrow { stroke: #27ae60; stroke-width: 2; fill: none; stroke-dasharray: 5,5; marker-end: url(#arrowhead-green); }
+      .cpu-block { fill: #fff3cd; stroke: #ff9800; stroke-width: 2; }
+      .gpu-block { fill: #e8f4f8; stroke: #0275d8; stroke-width: 2; }
+      .memory-block { fill: #f5f5f5; stroke: #666; stroke-width: 1; }
+      .key-block { fill: #e8f5e9; stroke: #27ae60; stroke-width: 2; }
+      .text { font-family: monospace; font-size: 11px; }
+      .comparison { font-size: 12px; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#333" />
+    </marker>
+    <marker id="arrowhead-green" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#27ae60" />
+    </marker>
+  </defs>
+
+  <!-- TITLE -->
+  <text x="700" y="35" class="title" text-anchor="middle">BREAD Proposed: CPU-Primary + GPU Turbo (KTransformers Pattern)</text>
+
+  <!-- ============================================================
+       CPU MAIN LOOP (Left Side)
+       ============================================================ -->
+  <g>
+    <text x="220" y="80" class="subtitle">CPU ORCHESTRATOR (Primary Engine)</text>
+
+    <!-- Input: CPU hidden -->
+    <rect x="80" y="110" width="280" height="50" class="cpu-block" rx="5"/>
+    <text x="220" y="140" class="block-label" text-anchor="middle">h_hidden (Host RAM) 48GB</text>
+
+    <!-- Main loop -->
+    <text x="220" y="190" class="text" text-anchor="middle">FOR layer in 40:</text>
+
+    <!-- 1. Prepare activation for routing (CPU) -->
+    <rect x="80" y="210" width="280" height="50" class="cpu-block" rx="5"/>
+    <text x="220" y="240" class="block-label" text-anchor="middle">RMSNorm + Route (CPU)</text>
+    <text x="220" y="257" class="time-label" text-anchor="middle">~1ms</text>
+
+    <!-- 2. Fire GPU attention async -->
+    <rect x="80" y="280" width="280" height="60" class="gpu-block" rx="5"/>
+    <text x="220" y="308" class="block-label" text-anchor="middle">GPU: Attention (Fire Async!)</text>
+    <text x="220" y="326" class="time-label" text-anchor="middle">~2-3ms, doesn't block CPU</text>
+
+    <!-- 3. CPU expert computation (parallel) -->
+    <rect x="80" y="360" width="280" height="80" class="key-block" rx="5"/>
+    <text x="220" y="388" class="block-label" text-anchor="middle">8 Experts Parallel (CPU)</text>
+    <text x="220" y="408" class="text" text-anchor="middle">OpenMP: 8 threads</text>
+    <text x="220" y="426" class="time-label" text-anchor="middle">~12-15ms/layer</text>
+
+    <!-- 4. Wait for GPU attention (sync point) -->
+    <rect x="80" y="460" width="280" height="50" class="gpu-block" rx="5"/>
+    <text x="220" y="490" class="block-label" text-anchor="middle">Sync: Wait GPU Attention</text>
+    <text x="220" y="507" class="time-label" text-anchor="middle">~0ms (usually hidden)</text>
+
+    <!-- 5. Combine results -->
+    <rect x="80" y="530" width="280" height="50" class="cpu-block" rx="5"/>
+    <text x="220" y="560" class="block-label" text-anchor="middle">Combine Expert + Attn (CPU)</text>
+
+    <!-- Output -->
+    <rect x="80" y="600" width="280" height="50" class="cpu-block" rx="5"/>
+    <text x="220" y="630" class="block-label" text-anchor="middle">h_hidden (next layer)</text>
+
+    <!-- Arrows -->
+    <path d="M 220 160 L 220 210" class="arrow"/>
+    <path d="M 220 260 L 220 280" class="arrow"/>
+    <path d="M 220 340 L 220 360" class="arrow"/>
+    <path d="M 220 440 L 220 460" class="arrow"/>
+    <path d="M 220 510 L 220 530" class="arrow"/>
+    <path d="M 220 580 L 220 600" class="arrow"/>
+
+  </g>
+
+  <!-- ============================================================
+       GPU ACCELERATOR (Right Side)
+       ============================================================ -->
+  <g>
+    <text x="1080" y="80" class="subtitle">GPU ACCELERATOR (Boost Layer)</text>
+
+    <!-- Input: activation from CPU -->
+    <rect x="940" y="110" width="280" height="50" class="memory-block" rx="5"/>
+    <text x="1080" y="140" class="block-label" text-anchor="middle">Attn Input (small, ~16KB)</text>
+
+    <!-- Waiting idle -->
+    <text x="1080" y="190" class="text" text-anchor="middle">↓ CPU does routing</text>
+    <text x="1080" y="208" class="text" text-anchor="middle">(GPU idle, safe to preload)</text>
+
+    <!-- Full attention -->
+    <rect x="940" y="230" width="280" height="100" class="gpu-block" rx="5"/>
+    <text x="1080" y="265" class="block-label" text-anchor="middle">Full-Attention (GPU)</text>
+    <text x="1080" y="285" class="text" text-anchor="middle">Q/K/V proj + softmax +</text>
+    <text x="1080" y="303" class="text" text-anchor="middle">output proj (GQA, RoPE)</text>
+    <text x="1080" y="321" class="time-label" text-anchor="middle">~2-3ms</text>
+
+    <!-- Optional: Shared FFN on GPU -->
+    <rect x="940" y="350" width="280" height="60" class="gpu-block" rx="5"/>
+    <text x="1080" y="375" class="block-label" text-anchor="middle">Shared FFN (Optional)</text>
+    <text x="1080" y="393" class="time-label" text-anchor="middle">~1-2ms if worth it</text>
+
+    <!-- Output buffer -->
+    <rect x="940" y="430" width="280" height="50" class="memory-block" rx="5"/>
+    <text x="1080" y="460" class="block-label" text-anchor="middle">Attn Output (VRAM)</text>
+
+  </g>
+
+  <!-- ============================================================
+       OVERLAP VISUALIZATION (Center)
+       ============================================================ -->
+  <g>
+    <text x="700" y="730" class="subtitle">Async Overlap Pattern (Per Layer)</text>
+
+    <!-- Timeline -->
+    <line x1="100" y1="780" x2="1300" y2="780" stroke="#999" stroke-width="1" stroke-dasharray="3,3"/>
+
+    <!-- CPU expert computation bar -->
+    <rect x="150" y="800" width="400" height="40" class="cpu-block" rx="3"/>
+    <text x="350" y="828" class="text" text-anchor="middle">CPU: 8 Experts (12-15ms)</text>
+
+    <!-- GPU attention bar (overlapped) -->
+    <rect x="200" y="860" width="60" height="40" class="gpu-block" rx="3"/>
+    <text x="230" y="883" class="text" text-anchor="middle">GPU Attn (2-3ms)</text>
+
+    <!-- Sync point -->
+    <line x1="600" y1="795" x2="600" y2="925" stroke="#d9534f" stroke-width="2" stroke-dasharray="5,5"/>
+    <text x="610" y="860" class="time-label">Sync</text>
+
+    <!-- Timeline labels -->
+    <text x="150" y="760" class="text">0ms</text>
+    <text x="550" y="760" class="text">~12-15ms</text>
+    <text x="650" y="760" class="text">Layer boundary</text>
+
+    <!-- Annotation -->
+    <text x="700" y="970" class="comparison" text-anchor="middle">✓ GPU attention hidden in CPU expert compute time</text>
+    <text x="700" y="990" class="comparison" text-anchor="middle">✓ Only one sync point per layer (not per expert)</text>
+  </g>
+
+  <!-- ============================================================
+       COMPARISON TABLE (Bottom Right)
+       ============================================================ -->
+  <g>
+    <rect x="900" y="730" width="450" height="240" class="memory-block" rx="5"/>
+
+    <text x="920" y="750" class="subtitle">Performance Comparison</text>
+
+    <text x="920" y="775" class="comparison">Current Baseline (GPU-only):</text>
+    <text x="930" y="793" class="text">  • Mode 1 Default: 6.11 tok/s</text>
+    <text x="930" y="811" class="text">  • Mode 2 SSD: 5.48 tok/s</text>
+    <text x="930" y="829" class="text">  • Mode 3 CPU: 1.76 tok/s ❌</text>
+
+    <text x="920" y="857" class="comparison">Proposed (CPU-Primary):</text>
+    <text x="930" y="875" class="text">  • Conservative: 12-14 tok/s</text>
+    <text x="930" y="893" class="text">  • Realistic: 14-16 tok/s</text>
+    <text x="930" y="911" class="text">  • Optimistic: 16-18 tok/s</text>
+
+    <text x="920" y="939" class="gain">Gain: 2.3-3.3x vs current baseline</text>
+  </g>
+
+  <!-- ============================================================
+       KEY INSIGHTS (Bottom Left)
+       ============================================================ -->
+  <g>
+    <rect x="50" y="730" width="800" height="240" class="key-block" rx="5"/>
+
+    <text x="70" y="750" class="subtitle">Why This Works (KTransformers Pattern)</text>
+
+    <text x="70" y="775" class="text">✓ CPU at 12 tok/s baseline (proven by llama.cpp)</text>
+    <text x="70" y="793" class="text">✓ GPU acceleration for attention layers (high-ROI work)</text>
+    <text x="70" y="811" class="text">✓ No memcpy on critical path (activation is small 8KB)</text>
+    <text x="70" y="829" class="text">✓ Async GPU fire → CPU works in parallel → natural overlap</text>
+
+    <text x="70" y="857" class="text">Per-Layer Breakdown:</text>
+    <text x="80" y="875" class="text">  CPU routing: ~1ms</text>
+    <text x="80" y="893" class="text">  CPU 8 experts parallel: ~12-15ms (✓ parallel)</text>
+    <text x="80" y="911" class="text">  GPU attention: ~2-3ms (✓ overlaps with CPU)</text>
+    <text x="80" y="929" class="text">  Total per layer: ~12-15ms (GPU is hidden!)</text>
+
+    <text x="70" y="955" class="text">× 40 layers × 1 token = ~480-600ms per token = 16-20 tok/s</text>
+  </g>
+
+</svg>

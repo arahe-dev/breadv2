@@ -381,7 +381,8 @@ __global__ void fused_q4k_gate_up_matvec(
 /* ================================================================== */
 
 /* Fused down Q6_K matvec + scale_accum into d_hidden.
- * Eliminates d_eo temporary buffer round-trip. */
+ * Eliminates d_eo temporary buffer round-trip.
+ * Matches layout of dequant_q6k_matvec for correctness. */
 __global__ void fused_q6k_down_accum(
     const uint8_t * __restrict__ down_w,  /* H × expert_inter Q6_K blocks */
     const half * __restrict__ x,          /* [expert_inter] input (from SwiGLU) */
@@ -394,26 +395,43 @@ __global__ void fused_q6k_down_accum(
 
     if (row >= H) return;
 
+    int nblocks = expert_inter / BLOCK_ELEMS;
     float sum = 0.0f;
 
-    for (int block_idx = 0; block_idx < expert_inter; block_idx += BLOCK_ELEMS) {
-        const uint8_t *blk = down_w + row * ((expert_inter + BLOCK_ELEMS - 1) / BLOCK_ELEMS) * Q6K_BLOCK_BYTES +
-                            (block_idx / BLOCK_ELEMS) * Q6K_BLOCK_BYTES;
+    for (int b = 0; b < nblocks; b++) {
+        /* Load x values into registers (same as thread ID maps to element in this block) */
+        float x_val = __half2float(x[b * BLOCK_ELEMS + tid]);
 
-        int elem_start = block_idx + tid;
-        if (elem_start < expert_inter) {
-            float w_val = dequant_q6k_elem(blk, tid);
-            float x_val = __half2float(x[elem_start]);
-            sum = fmaf(w_val, x_val, sum);
-        }
+        /* Get block pointer: row-major layout */
+        const uint8_t *blk = down_w + ((size_t)row * nblocks + b) * Q6K_BLOCK_BYTES;
+
+        /* Dequantize and multiply */
+        float w_val = dequant_q6k_elem(blk, tid);
+        sum = fmaf(w_val, x_val, sum);
     }
+
+    /* Warp reduce: each warp computes its partial sum */
+    int warp = tid >> 5;   /* warp ID (0-7 for 256 threads) */
+    int lane = tid & 31;   /* lane within warp (0-31) */
 
     for (int delta = 16; delta > 0; delta /= 2)
         sum += __shfl_down_sync(0xffffffff, sum, delta);
 
+    /* Each warp lane 0 has the warp partial sum, need to reduce across warps */
+    __shared__ float warp_sums[8];
+    if (lane == 0) {
+        warp_sums[warp] = sum;
+    }
+    __syncthreads();
+
+    /* Thread 0 reduces warp sums */
     if (tid == 0) {
+        float total_sum = 0.0f;
+        for (int w = 0; w < 8; w++) {
+            total_sum += warp_sums[w];
+        }
         float h_val = __half2float(hidden[row]);
-        hidden[row] = __float2half(fmaf(scale, sum, h_val));
+        hidden[row] = __float2half(fmaf(scale, total_sum, h_val));
     }
 }
 

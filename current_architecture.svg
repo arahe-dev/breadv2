@@ -1,0 +1,203 @@
+<svg viewBox="0 0 1400 900" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .mode-title { font-size: 18px; font-weight: bold; }
+      .block-label { font-size: 14px; font-weight: bold; }
+      .time-label { font-size: 12px; fill: #d9534f; }
+      .throughput { font-size: 16px; font-weight: bold; fill: #5cb85c; }
+      .arrow { stroke: #333; stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+      .async-arrow { stroke: #0275d8; stroke-width: 2; fill: none; stroke-dasharray: 5,5; marker-end: url(#arrowhead-blue); }
+      .gpu-block { fill: #e8f4f8; stroke: #0275d8; stroke-width: 2; }
+      .cpu-block { fill: #fff3cd; stroke: #ff9800; stroke-width: 2; }
+      .memory-block { fill: #f5f5f5; stroke: #666; stroke-width: 1; }
+      .bottleneck { fill: #ffcccc; stroke: #d9534f; stroke-width: 2; }
+      .text { font-family: monospace; font-size: 11px; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#333" />
+    </marker>
+    <marker id="arrowhead-blue" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#0275d8" />
+    </marker>
+  </defs>
+
+  <!-- TITLE -->
+  <text x="700" y="35" class="mode-title" text-anchor="middle">BREAD Current Architecture: 3 Execution Modes</text>
+
+  <!-- ============================================================
+       MODE 1: DEFAULT (GPU Pre-Cached)
+       ============================================================ -->
+  <g>
+    <!-- Title -->
+    <text x="230" y="80" class="mode-title">Mode 1: GPU Pre-Cache</text>
+    <text x="230" y="105" class="throughput">6.11 tok/s</text>
+
+    <!-- Input: GPU hidden -->
+    <rect x="120" y="130" width="220" height="50" class="gpu-block" rx="5"/>
+    <text x="230" y="160" class="block-label" text-anchor="middle">d_hidden (GPU VRAM)</text>
+
+    <!-- Layer loop -->
+    <text x="230" y="220" class="text" text-anchor="middle">FOR layer in 40:</text>
+
+    <!-- Attention -->
+    <rect x="120" y="240" width="220" height="60" class="gpu-block" rx="5"/>
+    <text x="230" y="268" class="block-label" text-anchor="middle">Full-Attn (GPU)</text>
+    <text x="230" y="288" class="time-label" text-anchor="middle">~2ms/layer</text>
+
+    <!-- Expert loop -->
+    <text x="230" y="330" class="text" text-anchor="middle">FOR expert in 8:</text>
+
+    <!-- Expert matvec (bottleneck) -->
+    <rect x="80" y="350" width="300" height="80" class="bottleneck" rx="5"/>
+    <text x="230" y="378" class="block-label" text-anchor="middle">Expert Matvec (GPU Serial)</text>
+    <text x="230" y="400" class="time-label" text-anchor="middle">~4ms/layer × 40 = 160ms/token</text>
+    <text x="230" y="418" class="text" text-anchor="middle">gate→up→SwiGLU→down</text>
+
+    <!-- Accumulate -->
+    <rect x="120" y="450" width="220" height="50" class="gpu-block" rx="5"/>
+    <text x="230" y="480" class="block-label" text-anchor="middle">Accumulate (GPU)</text>
+
+    <!-- Output -->
+    <rect x="120" y="530" width="220" height="50" class="gpu-block" rx="5"/>
+    <text x="230" y="560" class="block-label" text-anchor="middle">d_hidden (GPU)</text>
+
+    <!-- Arrows -->
+    <path d="M 230 180 L 230 240" class="arrow"/>
+    <path d="M 230 300 L 230 350" class="arrow"/>
+    <path d="M 230 430 L 230 450" class="arrow"/>
+    <path d="M 230 500 L 230 530" class="arrow"/>
+
+    <!-- Analysis box -->
+    <rect x="80" y="620" width="300" height="100" class="memory-block" rx="5"/>
+    <text x="90" y="640" class="text">VRAM: 6.5GB experts + overhead</text>
+    <text x="90" y="658" class="text">Shared memory spill: ~14GB</text>
+    <text x="90" y="676" class="text">Bottleneck: Expert serial GPU</text>
+    <text x="90" y="694" class="text">Per-token: 567ms (~163ms data)</text>
+    <text x="90" y="712" class="text">Problem: GPU can't parallelize</text>
+  </g>
+
+  <!-- ============================================================
+       MODE 2: SSD STREAMING
+       ============================================================ -->
+  <g>
+    <!-- Title -->
+    <text x="700" y="80" class="mode-title">Mode 2: SSD Streaming (Path C)</text>
+    <text x="700" y="105" class="throughput">5.48 tok/s</text>
+
+    <!-- Storage tiers -->
+    <rect x="550" y="130" width="80" height="40" class="memory-block" rx="3"/>
+    <text x="590" y="158" class="text" text-anchor="middle">SSD</text>
+
+    <rect x="660" y="130" width="80" height="40" class="memory-block" rx="3"/>
+    <text x="700" y="158" class="text" text-anchor="middle">Host RAM</text>
+
+    <rect x="770" y="130" width="80" height="40" class="gpu-block" rx="3"/>
+    <text x="810" y="158" class="text" text-anchor="middle">VRAM</text>
+
+    <!-- Main loop -->
+    <text x="700" y="220" class="text" text-anchor="middle">FOR layer in 40:</text>
+
+    <!-- Attention -->
+    <rect x="590" y="240" width="220" height="60" class="gpu-block" rx="5"/>
+    <text x="700" y="268" class="block-label" text-anchor="middle">Full-Attn (GPU)</text>
+    <text x="700" y="288" class="time-label" text-anchor="middle">~2ms/layer</text>
+
+    <!-- Expert loop -->
+    <text x="700" y="330" class="text" text-anchor="middle">FOR expert in 8:</text>
+
+    <!-- Load expert from SSD -->
+    <rect x="550" y="350" width="300" height="50" class="memory-block" rx="5"/>
+    <text x="700" y="378" class="block-label" text-anchor="middle">Load Expert SSD→RAM→VRAM (DMA)</text>
+    <text x="700" y="395" class="time-label" text-anchor="middle">~2ms/expert (async)</text>
+
+    <!-- Expert matvec -->
+    <rect x="590" y="420" width="220" height="70" class="gpu-block" rx="5"/>
+    <text x="700" y="450" class="block-label" text-anchor="middle">Expert Matvec (GPU Serial)</text>
+    <text x="700" y="468" class="time-label" text-anchor="middle">~3ms/layer</text>
+
+    <!-- Accumulate -->
+    <rect x="590" y="520" width="220" height="50" class="gpu-block" rx="5"/>
+    <text x="700" y="550" class="block-label" text-anchor="middle">Accumulate (GPU)</text>
+
+    <!-- Output -->
+    <rect x="590" y="600" width="220" height="50" class="gpu-block" rx="5"/>
+    <text x="700" y="630" class="block-label" text-anchor="middle">d_hidden (GPU)</text>
+
+    <!-- Arrows -->
+    <path d="M 700 220 L 700 240" class="arrow"/>
+    <path d="M 700 300 L 700 350" class="arrow"/>
+    <path d="M 700 400 L 700 420" class="arrow"/>
+    <path d="M 700 490 L 700 520" class="arrow"/>
+    <path d="M 700 570 L 700 600" class="arrow"/>
+
+    <!-- Analysis box -->
+    <rect x="550" y="680" width="300" height="110" class="memory-block" rx="5"/>
+    <text x="560" y="700" class="text">VRAM: 1.4GB (clean!)</text>
+    <text x="560" y="718" class="text">Shared memory: 150MB (clean!)</text>
+    <text x="560" y="736" class="text">Bottleneck: Still expert serial GPU</text>
+    <text x="560" y="754" class="text">+ DMA async (hidden by GPU compute)</text>
+    <text x="560" y="772" class="text">Per-token: 567ms (slightly faster)</text>
+  </g>
+
+  <!-- ============================================================
+       MODE 3: CPU EXPERTS
+       ============================================================ -->
+  <g>
+    <!-- Title -->
+    <text x="1170" y="80" class="mode-title">Mode 3: CPU Experts (Path D)</text>
+    <text x="1170" y="105" class="throughput">1.76 tok/s ❌</text>
+
+    <!-- Input: GPU hidden -->
+    <rect x="1020" y="130" width="220" height="50" class="gpu-block" rx="5"/>
+    <text x="1130" y="160" class="block-label" text-anchor="middle">d_hidden (GPU VRAM)</text>
+
+    <!-- Layer loop -->
+    <text x="1130" y="220" class="text" text-anchor="middle">FOR layer in 40:</text>
+
+    <!-- Attention -->
+    <rect x="1020" y="240" width="220" height="60" class="gpu-block" rx="5"/>
+    <text x="1130" y="268" class="block-label" text-anchor="middle">Full-Attn (GPU)</text>
+    <text x="1130" y="288" class="time-label" text-anchor="middle">~2ms/layer</text>
+
+    <!-- Copy to CPU -->
+    <rect x="980" y="330" width="300" height="50" class="bottleneck" rx="5"/>
+    <text x="1130" y="360" class="block-label" text-anchor="middle">H2D Copy (GPU→CPU) 8KB</text>
+    <text x="1130" y="377" class="time-label" text-anchor="middle">~50-200μs + sync = 1-2ms/layer</text>
+
+    <!-- CPU experts (parallel) -->
+    <rect x="1020" y="410" width="220" height="60" class="cpu-block" rx="5"/>
+    <text x="1130" y="435" class="block-label" text-anchor="middle">8 Experts Parallel (CPU)</text>
+    <text x="1130" y="453" class="time-label" text-anchor="middle">~10-15ms/layer</text>
+
+    <!-- Copy back to GPU -->
+    <rect x="980" y="500" width="300" height="50" class="bottleneck" rx="5"/>
+    <text x="1130" y="530" class="block-label" text-anchor="middle">D2H Copy (CPU→GPU) 16KB + sync</text>
+    <text x="1130" y="547" class="time-label" text-anchor="middle">~50-200μs + sync = 1-2ms/layer</text>
+
+    <!-- Accumulate on GPU -->
+    <rect x="1020" y="580" width="220" height="50" class="gpu-block" rx="5"/>
+    <text x="1130" y="610" class="block-label" text-anchor="middle">Accumulate (GPU)</text>
+
+    <!-- Output -->
+    <rect x="1020" y="660" width="220" height="50" class="gpu-block" rx="5"/>
+    <text x="1130" y="690" class="block-label" text-anchor="middle">d_hidden (GPU)</text>
+
+    <!-- Arrows -->
+    <path d="M 1130 180 L 1130 240" class="arrow"/>
+    <path d="M 1130 300 L 1130 330" class="arrow"/>
+    <path d="M 1130 380 L 1130 410" class="arrow"/>
+    <path d="M 1130 470 L 1130 500" class="arrow"/>
+    <path d="M 1130 550 L 1130 580" class="arrow"/>
+    <path d="M 1130 630 L 1130 660" class="arrow"/>
+
+    <!-- Analysis box -->
+    <rect x="980" y="740" width="300" height="120" class="memory-block" rx="5"/>
+    <text x="990" y="760" class="text">Breakdown per layer:</text>
+    <text x="990" y="778" class="text">  GPU attn: 2ms</text>
+    <text x="990" y="796" class="text">  H2D copy + sync: 1-2ms</text>
+    <text x="990" y="814" class="text">  CPU experts: 10-15ms ⚠️</text>
+    <text x="990" y="832" class="text">  D2H copy + sync: 1-2ms</text>
+    <text x="990" y="850" class="text">  Total: ~14-21ms/layer × 40 ≈ 567ms 😱</text>
+  </g>
+
+</svg>

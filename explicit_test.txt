@@ -1,0 +1,6 @@
+<|im_start|>user
+hello
+<|im_end|>
+<|im_start|>assistant
+
+

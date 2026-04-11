@@ -49,6 +49,14 @@
 extern void bread_matvec(void *w, half *x, half *y,
                           int rows, int cols, int qtype, cudaStream_t stream);
 
+/* Fused kernels (Phase 2 optimization) */
+extern void bread_matvec_fused_down_accum(void *down_w, const half *x, half *hidden,
+                                           float scale, int H, int expert_inter,
+                                           cudaStream_t stream);
+
+/* Fused gate+up matvec for Phase 2 (pending architecture refactor) */
+/* extern void fused_q4k_gate_up_matvec(...); -- deferred, requires output struct */
+
 /* ================================================================== */
 /* Phase 2: GPU-side routing kernels                                  */
 /* ================================================================== */

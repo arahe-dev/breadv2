@@ -1,0 +1,22 @@
+file bread_debug.exe
+set args --server --tokens 100
+
+# Set breakpoint in the main generation loop (line 652 in main.cu)
+break main.cu:652
+
+# Start the program
+run < /tmp/test_single_query.txt
+
+# Continue until we're close to token 54
+commands 1
+silent
+continue
+end
+
+# At token 54, switch to more detailed debugging
+break main.cu:653
+
+# Watch for writes to SSM state (we'll add this after first run)
+# When we hit token 54, we can inspect and watch memory
+
+quit

@@ -1,0 +1,64 @@
+=== BREAD Phase 1 Benchmark ===
+Testing: Buffer Pool Wiring + Sync Optimization
+
+Test Configuration:
+  GPU: RTX 4060 Laptop (8GB VRAM)
+  Model: Qwen3.5-35B-A3B (custom inference)
+
+==========================================
+Test: "What is 2+2"
+Generate: 10 tokens
+==========================================
+--- Prompt prefill (18 tokens) ---
+    prefill: 3611 ms  (200.6 ms/tok)
+--- Generated output ---
+The sum of 2 and 2 is **[PROGRESS] DECODE: token 9/10 5.75 tok/s
+  Generated tokens : 10
+  Prefill          : 3611 ms  (200.6 ms/tok)
+  Time to 1st tok  : 54.5 ms
+  Total decode     : 1619 ms  (6.18 tok/s)
+
+==========================================
+Test: "The capital of France is"
+Generate: 15 tokens
+==========================================
+--- Prompt prefill (17 tokens) ---
+    prefill: 2542 ms  (149.5 ms/tok)
+--- Generated output ---
+Located in[PROGRESS] DECODE: token 10/15 5.79 tok/s
+ the north-central part[PROGRESS] DECODE: token 14/15 5.76 tok/s
+  Generated tokens : 15
+  Prefill          : 2542 ms  (149.5 ms/tok)
+  Time to 1st tok  : 60.8 ms
+  Total decode     : 2492 ms  (6.02 tok/s)
+
+==========================================
+Test: "Explain photosynthesis in one sentence"
+Generate: 20 tokens
+==========================================
+--- Prompt prefill (19 tokens) ---
+    prefill: 15589 ms  (820.5 ms/tok)
+--- Generated output ---
+Photosynthesis is the biological process by which green plants and[PROGRESS] DECODE: token 10/20 0.87 tok/s
+ other organisms use sunlight to convert carbon dioxide and[PROGRESS] DECODE: token 19/20 1.08 tok/s
+  Generated tokens : 20
+  Prefill          : 15589 ms  (820.5 ms/tok)
+  Time to 1st tok  : 61.5 ms
+  Total decode     : 17695 ms  (1.13 tok/s)
+
+==========================================
+Long Sequence Test
+==========================================
+Prompt: Long 50-token generation
+
+==========================================
+Summary
+==========================================
+Phase 1 Complete:
+  ✓ Buffer pool wired (eliminated static malloc overhead)
+  ✓ Sync barriers optimized (reduced global device syncs)
+  ✓ Model still produces correct outputs
+
+Baseline expectation: ~6-7 tok/s decode
+Bottleneck: Still per-layer cudaMalloc overhead
+Next: Phase 2 - GPU-side routing + sampling

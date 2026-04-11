@@ -1,0 +1,26 @@
+loader: initialising...
+gguf: version=3  tensors=1959  kv_pairs=57
+gguf: alignment=32 bytes
+gguf: header parsed in 1.332 s  —  data section at 0xb83a00
+loader: 40 MoE layers found, expert slot size = 2039808 bytes (1.95 MiB)
+loader: allocating 18 VRAM slots × 1.95 MiB = 35.02 MiB
+loader: allocating 23.87 GB host memory...
+loader: reading model...   2.2% (1.71 GB/s)loader: reading model...   4.5% (1.73 GB/s)loader: reading model...   6.7% (1.72 GB/s)loader: reading model...   9.0% (1.71 GB/s)loader: reading model...  11.2% (1.70 GB/s)loader: reading model...  13.5% (1.70 GB/s)loader: reading model...  15.7% (1.70 GB/s)loader: reading model...  18.0% (1.68 GB/s)loader: reading model...  20.2% (1.67 GB/s)loader: reading model...  22.5% (1.65 GB/s)loader: reading model...  24.7% (1.64 GB/s)loader: reading model...  27.0% (1.63 GB/s)loader: reading model...  29.2% (1.62 GB/s)loader: reading model...  31.5% (1.61 GB/s)loader: reading model...  33.7% (1.61 GB/s)loader: reading model...  36.0% (1.60 GB/s)loader: reading model...  38.2% (1.60 GB/s)loader: reading model...  40.5% (1.60 GB/s)loader: reading model...  42.7% (1.59 GB/s)loader: reading model...  45.0% (1.58 GB/s)loader: reading model...  47.2% (1.53 GB/s)loader: reading model...  49.5% (1.44 GB/s)loader: reading model...  51.7% (1.38 GB/s)loader: reading model...  54.0% (1.34 GB/s)loader: reading model...  56.2% (1.30 GB/s)loader: reading model...  58.5% (1.26 GB/s)loader: reading model...  60.7% (1.26 GB/s)loader: reading model...  63.0% (1.26 GB/s)loader: reading model...  65.2% (1.27 GB/s)loader: reading model...  67.5% (1.27 GB/s)loader: reading model...  69.7% (1.27 GB/s)loader: reading model...  72.0% (1.27 GB/s)loader: reading model...  74.2% (1.27 GB/s)loader: reading model...  76.5% (1.27 GB/s)loader: reading model...  78.7% (1.27 GB/s)loader: reading model...  81.0% (1.27 GB/s)loader: reading model...  83.2% (1.28 GB/s)loader: reading model...  85.5% (1.28 GB/s)loader: reading model...  87.7% (1.28 GB/s)loader: reading model...  90.0% (1.28 GB/s)loader: reading model...  92.2% (1.28 GB/s)loader: reading model...  94.5% (1.29 GB/s)loader: reading model...  96.7% (1.29 GB/s)loader: reading model...  99.0% (1.29 GB/s)loader: read 23.87 GB in 18.5 s (1.29 GB/s)            
+loader: ready (host RAM, 18 VRAM slots)
+gguf: version=3  tensors=1959  kv_pairs=57
+gguf: alignment=32 bytes
+gguf: header parsed in 0.027 s  —  data section at 0xb83a00
+weight_cache: loading expert weights to VRAM...
+weight_cache: loaded experts, total VRAM: 20689.4 MiB
+tokenizer: vocab=248320 merges=247587 bos=-1 eos=248046 specials=276
+weight_cache: loaded 40 layers, 769.4 MiB VRAM
+BREAD_READY
+<think>
+
+</think>
+
+### How Binary Addition Works
+
+Binary addition is the fundamental arithmetic operation performed by computers. Since computers operate using electronic switches that are either **on** (1) or **off** (0), all data and calculations are ultimately reduced
+BREAD_END
+loader: shutting down — 0 hits, 0 misses
