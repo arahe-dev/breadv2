@@ -283,6 +283,12 @@ __global__ void dequant_q8_0_matvec(
     }
 }
 
+/* Forward declaration of fused kernels (defined below) */
+__global__ void fused_q6k_down_accum(const uint8_t * __restrict__ down_w,
+                                     const half * __restrict__ x,
+                                     half * __restrict__ hidden,
+                                     float scale, int H, int expert_inter);
+
 /* ------------------------------------------------------------------ */
 /* Host dispatcher                                                      */
 /* ------------------------------------------------------------------ */
@@ -305,6 +311,110 @@ void bread_matvec(void *w, half *x, half *y, int rows, int cols, int qtype, cuda
         exit(1);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+/* Fused down + accumulate wrapper (for future use) */
+void bread_matvec_fused_down_accum(void *down_w, const half *x, half *hidden,
+                                    float scale, int H, int expert_inter,
+                                    cudaStream_t stream)
+{
+    dim3 grid(H);
+    dim3 block(THREADS_PER_ROW);
+    fused_q6k_down_accum<<<grid, block, 0, stream>>>(
+        (const uint8_t *)down_w, x, hidden, scale, H, expert_inter);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/* ================================================================== */
+/* KERNEL FUSION: Fused gate+up matvec (Phase 2 optimization)        */
+/* ================================================================== */
+
+/* Fused gate+up Q4_K matvec: read x once, output both projections.
+ * Saves one global read of x per expert.
+ * One block per row, stride through gate/up alternately. */
+__global__ void fused_q4k_gate_up_matvec(
+    const uint8_t * __restrict__ gate_w,  /* expert_inter × cols Q4_K blocks */
+    const uint8_t * __restrict__ up_w,    /* expert_inter × cols Q4_K blocks */
+    const half * __restrict__ x,          /* [cols] input */
+    half * __restrict__ gate_out,         /* [expert_inter] output */
+    half * __restrict__ up_out,           /* [expert_inter] output */
+    int expert_inter, int cols)
+{
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if (row >= 2 * expert_inter) return;
+
+    int is_gate = (row < expert_inter);
+    int actual_row = is_gate ? row : (row - expert_inter);
+    const uint8_t *w = is_gate ? gate_w : up_w;
+
+    float sum = 0.0f;
+
+    for (int block_idx = 0; block_idx < cols; block_idx += BLOCK_ELEMS) {
+        const uint8_t *blk = w + actual_row * ((cols + BLOCK_ELEMS - 1) / BLOCK_ELEMS) * Q4K_BLOCK_BYTES +
+                            (block_idx / BLOCK_ELEMS) * Q4K_BLOCK_BYTES;
+
+        int elem_start = block_idx + tid;
+        if (elem_start < cols) {
+            float w_val = dequant_q4k_elem(blk, tid);
+            float x_val = __half2float(x[elem_start]);
+            sum = fmaf(w_val, x_val, sum);
+        }
+    }
+
+    for (int delta = 16; delta > 0; delta /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, delta);
+
+    if (tid == 0) {
+        half out_val = __float2half(sum);
+        if (is_gate) {
+            gate_out[actual_row] = out_val;
+        } else {
+            up_out[actual_row] = out_val;
+        }
+    }
+}
+
+/* ================================================================== */
+/* KERNEL FUSION: Fused down+accumulate Q6_K (Phase 2 optimization)  */
+/* ================================================================== */
+
+/* Fused down Q6_K matvec + scale_accum into d_hidden.
+ * Eliminates d_eo temporary buffer round-trip. */
+__global__ void fused_q6k_down_accum(
+    const uint8_t * __restrict__ down_w,  /* H × expert_inter Q6_K blocks */
+    const half * __restrict__ x,          /* [expert_inter] input (from SwiGLU) */
+    half * __restrict__ hidden,           /* [H] to accumulate into */
+    float scale,                          /* routing weight */
+    int H, int expert_inter)
+{
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if (row >= H) return;
+
+    float sum = 0.0f;
+
+    for (int block_idx = 0; block_idx < expert_inter; block_idx += BLOCK_ELEMS) {
+        const uint8_t *blk = down_w + row * ((expert_inter + BLOCK_ELEMS - 1) / BLOCK_ELEMS) * Q6K_BLOCK_BYTES +
+                            (block_idx / BLOCK_ELEMS) * Q6K_BLOCK_BYTES;
+
+        int elem_start = block_idx + tid;
+        if (elem_start < expert_inter) {
+            float w_val = dequant_q6k_elem(blk, tid);
+            float x_val = __half2float(x[elem_start]);
+            sum = fmaf(w_val, x_val, sum);
+        }
+    }
+
+    for (int delta = 16; delta > 0; delta /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, delta);
+
+    if (tid == 0) {
+        float h_val = __half2float(hidden[row]);
+        hidden[row] = __float2half(fmaf(scale, sum, h_val));
+    }
 }
 
 /* ================================================================== */
